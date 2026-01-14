@@ -1,2 +1,0 @@
-"""RoboMan backend package."""
-
