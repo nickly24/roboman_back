@@ -39,6 +39,9 @@ DB_NAME = "roboman"
 # Pool
 DB_POOL_SIZE = 10
 
+# Upload limits
+MAX_PDF_BYTES = 10 * 1024 * 1024  # 10 MB
+
 
 # ------------------------------------------------------------
 # DB helpers (раньше было в db.py)
@@ -331,6 +334,7 @@ def create_app() -> Flask:
     CORS(app, resources={r"/api/*": {"origins": "*"}})
 
     API_BASE = os.environ.get("API_BASE", "/api").rstrip("/")
+    app.config["MAX_CONTENT_LENGTH"] = MAX_PDF_BYTES
 
     # ------------------------------------------------------------
     # Error handling
@@ -1523,6 +1527,8 @@ def create_app() -> Flask:
 
         if not pdf_bytes:
             abort(400, description="Empty PDF")
+        if len(pdf_bytes) > MAX_PDF_BYTES:
+            abort(413, description=f"PDF too large (max {MAX_PDF_BYTES // (1024 * 1024)} MB)")
 
         with db_cursor() as (_, cur):
             iid = exec_one(
