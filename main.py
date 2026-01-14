@@ -80,6 +80,7 @@ def get_pool() -> pooling.MySQLConnectionPool:
             database=cfg.database,
             port=cfg.port,
             autocommit=False,
+            pool_reset_session=True,
         )
     return _POOL
 
@@ -92,6 +93,12 @@ def db_cursor(*, dictionary: bool = True) -> Iterator[tuple[Any, Any]]:
     """
     pool = get_pool()
     conn = pool.get_connection()
+    # Страхуемся от "MySQL Connection not available" на старом соединении
+    try:
+        if not conn.is_connected():
+            conn.reconnect(attempts=2, delay=0)
+    except Exception:
+        conn.reconnect(attempts=2, delay=0)
     cur = conn.cursor(dictionary=dictionary, buffered=True)
     try:
         yield conn, cur
