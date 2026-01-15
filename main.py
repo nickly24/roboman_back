@@ -1278,6 +1278,7 @@ def create_app() -> Flask:
         full_name = (body.get("full_name") or "").strip()
         color = (body.get("color") or "").strip()
         status = (body.get("status") or "working").strip()
+        is_salary_free = 1 if _parse_bool(body.get("is_salary_free", False)) else 0
         create_user = _parse_bool(body.get("create_user", False))
         login = (body.get("login") or "").strip()
         password = body.get("password")
@@ -1286,7 +1287,11 @@ def create_app() -> Flask:
         if status not in ("working", "vacation", "fired"):
             abort(400, description="Invalid status")
         with db_cursor() as (_, cur):
-            tid = exec_one(cur, "INSERT INTO teachers(full_name, color, status) VALUES (%s,%s,%s)", (full_name, color, status))
+            tid = exec_one(
+                cur,
+                "INSERT INTO teachers(full_name, color, status, is_salary_free) VALUES (%s,%s,%s,%s)",
+                (full_name, color, status, is_salary_free),
+            )
             if create_user:
                 if not login or password is None:
                     abort(400, description="login/password required to create user")
@@ -1323,12 +1328,16 @@ def create_app() -> Flask:
         body = request.get_json(silent=True) or {}
         fields: list[str] = []
         params: list[Any] = []
-        for k in ["full_name", "color", "status"]:
+        for k in ["full_name", "color", "status", "is_salary_free"]:
             if k in body:
                 if k == "status" and body.get(k) not in ("working", "vacation", "fired"):
                     abort(400, description="Invalid status")
-                fields.append(f"{k}=%s")
-                params.append(body.get(k))
+                if k == "is_salary_free":
+                    fields.append("is_salary_free=%s")
+                    params.append(1 if _parse_bool(body.get(k)) else 0)
+                else:
+                    fields.append(f"{k}=%s")
+                    params.append(body.get(k))
         if not fields:
             abort(400, description="No fields to update")
         with db_cursor() as (_, cur):
@@ -1690,6 +1699,7 @@ def create_app() -> Flask:
                   l.is_creative,
                   l.instruction_id,
                   i.name AS instruction_name,
+                  l.is_salary_free,
                   l.price_snapshot,
                   l.revenue,
                   l.teacher_salary,
@@ -1720,6 +1730,7 @@ def create_app() -> Flask:
               l.is_creative,
               l.instruction_id,
               i.name AS instruction_name,
+              l.is_salary_free,
               l.teacher_salary,
               l.created_by_user_id,
               l.created_at,
@@ -1825,6 +1836,7 @@ def create_app() -> Flask:
         trial_children = body.get("trial_children")
         is_creative = body.get("is_creative")
         instruction_id = body.get("instruction_id")
+        is_salary_free: int | None = None
 
         if branch_id is None or starts_at is None or paid_children is None or trial_children is None or is_creative is None:
             abort(400, description="branch_id, starts_at, paid_children, trial_children, is_creative are required")
@@ -1883,11 +1895,18 @@ def create_app() -> Flask:
                 abort(400, description="Unknown branch")
             price_snapshot = br["price_per_child"]
 
+            if is_salary_free is None:
+                trow = fetch_one(cur, "SELECT is_salary_free FROM teachers WHERE id=%s", (int(teacher_id),))
+                is_salary_free = 1 if (trow and _parse_bool(trow.get("is_salary_free"))) else 0
+
             lid = exec_one(
                 cur,
                 """
-                INSERT INTO lessons(branch_id, teacher_id, starts_at, paid_children, trial_children, is_creative, instruction_id, price_snapshot, created_by_user_id)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                INSERT INTO lessons(
+                  branch_id, teacher_id, starts_at, paid_children, trial_children,
+                  is_creative, instruction_id, is_salary_free, price_snapshot, created_by_user_id
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 (
                     int(branch_id),
@@ -1897,6 +1916,7 @@ def create_app() -> Flask:
                     trial_i,
                     is_creative_b,
                     int(instruction_id) if instruction_id is not None else None,
+                    is_salary_free,
                     price_snapshot,
                     u.id,
                 ),
@@ -2011,6 +2031,37 @@ def create_app() -> Flask:
                 (lesson_id,),
             )
         return lessons_get(lesson_id)
+
+    def _lessons_set_salary_free(lesson_id: int, is_free: bool) -> Response:
+        u = _current_user()
+        with db_cursor() as (_, cur):
+            ok = fetch_one(
+                cur,
+                """
+                SELECT 1
+                FROM lessons l
+                JOIN branches b ON b.id=l.branch_id
+                JOIN department_owners do2 ON do2.department_id=b.department_id
+                WHERE l.id=%s AND do2.owner_id=%s
+                """,
+                (lesson_id, u.owner_id),
+            )
+            if not ok:
+                abort(404)
+            cur.execute("UPDATE lessons SET is_salary_free=%s WHERE id=%s", (1 if is_free else 0, lesson_id))
+        return lessons_get(lesson_id)
+
+    @app.put(f"{API_BASE}/lessons/<int:lesson_id>/salary-free")
+    @require_auth
+    @require_role("OWNER")
+    def lessons_salary_free(lesson_id: int) -> Response:
+        return _lessons_set_salary_free(lesson_id, True)
+
+    @app.put(f"{API_BASE}/lessons/<int:lesson_id>/salary-paid")
+    @require_auth
+    @require_role("OWNER")
+    def lessons_salary_paid(lesson_id: int) -> Response:
+        return _lessons_set_salary_free(lesson_id, False)
 
     @app.delete(f"{API_BASE}/lessons/<int:lesson_id>")
     @require_auth
