@@ -41,6 +41,7 @@ DB_POOL_SIZE = 10
 
 # Upload limits
 MAX_PDF_BYTES = 10 * 1024 * 1024  # 10 MB
+MAX_PHOTO_BYTES = 5 * 1024 * 1024  # 5 MB
 
 
 # ------------------------------------------------------------
@@ -645,6 +646,108 @@ def create_app() -> Flask:
         with db_cursor() as (_, cur):
             cur.execute("DELETE FROM auf_users WHERE id=%s", (user_id,))
         return _ok({"deleted": True})
+
+    # ------------------------------------------------------------
+    # Teacher accounts (auf_users linked to teachers) - only OWNER
+    # ------------------------------------------------------------
+    @app.get(f"{API_BASE}/teacher-accounts")
+    @require_auth
+    @require_role("OWNER")
+    def teacher_accounts_list() -> Response:
+        args = dict(request.args)
+        status = (args.get("status") or "").strip()
+        q = (args.get("q") or "").strip()
+        limit, offset = _paginate(args)
+
+        where: list[str] = ["1=1"]
+        params: list[Any] = []
+        if status:
+            where.append("t.status=%s")
+            params.append(status)
+        if q:
+            where.append("(t.full_name LIKE %s OR u.login LIKE %s)")
+            params.extend([f"%{q}%", f"%{q}%"])
+
+        sql = f"""
+            SELECT
+                t.id AS teacher_id,
+                t.full_name,
+                t.status,
+                t.color,
+                t.is_salary_free,
+                u.id AS user_id,
+                u.login,
+                u.password_hash AS password,
+                u.is_active,
+                u.created_at AS user_created_at,
+                u.updated_at AS user_updated_at
+            FROM teachers t
+            LEFT JOIN auf_users u ON u.teacher_id=t.id AND u.role='TEACHER'
+            WHERE {' AND '.join(where)}
+            ORDER BY t.id DESC
+            LIMIT %s OFFSET %s
+        """
+        params.extend([limit, offset])
+        with db_cursor() as (_, cur):
+            rows = fetch_all(cur, sql, tuple(params))
+        return _ok({"items": rows, "limit": limit, "offset": offset})
+
+    @app.post(f"{API_BASE}/teacher-accounts")
+    @require_auth
+    @require_role("OWNER")
+    def teacher_accounts_create() -> Response:
+        body = request.get_json(silent=True) or {}
+        teacher_id = body.get("teacher_id")
+        login = (body.get("login") or "").strip()
+        password = body.get("password")
+        is_active = 1 if _parse_bool(body.get("is_active", True)) else 0
+
+        if teacher_id is None or not login or password is None:
+            abort(400, description="teacher_id, login, password are required")
+
+        with db_cursor() as (_, cur):
+            teacher = fetch_one(cur, "SELECT id FROM teachers WHERE id=%s", (teacher_id,))
+            if not teacher:
+                abort(404, description="Teacher not found")
+            exists = fetch_one(
+                cur,
+                "SELECT id FROM auf_users WHERE teacher_id=%s AND role='TEACHER'",
+                (teacher_id,),
+            )
+            if exists:
+                abort(400, description="Teacher already has account")
+
+            exec_one(
+                cur,
+                """
+                INSERT INTO auf_users(login, password_hash, role, teacher_id, is_active)
+                VALUES (%s,%s,'TEACHER',%s,%s)
+                """,
+                (login, str(password), teacher_id, is_active),
+            )
+
+            row = fetch_one(
+                cur,
+                """
+                SELECT
+                    t.id AS teacher_id,
+                    t.full_name,
+                    t.status,
+                    t.color,
+                    t.is_salary_free,
+                    u.id AS user_id,
+                    u.login,
+                    u.password_hash AS password,
+                    u.is_active,
+                    u.created_at AS user_created_at,
+                    u.updated_at AS user_updated_at
+                FROM teachers t
+                LEFT JOIN auf_users u ON u.teacher_id=t.id AND u.role='TEACHER'
+                WHERE t.id=%s
+                """,
+                (teacher_id,),
+            )
+        return _ok(row)
 
     # ------------------------------------------------------------
     # Owners - only OWNER
@@ -1328,6 +1431,7 @@ def create_app() -> Flask:
         body = request.get_json(silent=True) or {}
         fields: list[str] = []
         params: list[Any] = []
+        will_fire = False
         for k in ["full_name", "color", "status", "is_salary_free"]:
             if k in body:
                 if k == "status" and body.get(k) not in ("working", "vacation", "fired"):
@@ -1338,10 +1442,14 @@ def create_app() -> Flask:
                 else:
                     fields.append(f"{k}=%s")
                     params.append(body.get(k))
+                if k == "status" and body.get(k) == "fired":
+                    will_fire = True
         if not fields:
             abort(400, description="No fields to update")
         with db_cursor() as (_, cur):
             cur.execute(f"UPDATE teachers SET {', '.join(fields)} WHERE id=%s", tuple(params + [teacher_id]))
+            if will_fire:
+                cur.execute("DELETE FROM branch_teachers WHERE teacher_id=%s", (teacher_id,))
             row = fetch_one(cur, "SELECT * FROM teachers WHERE id=%s", (teacher_id,))
         if not row:
             abort(404)
@@ -1357,6 +1465,8 @@ def create_app() -> Flask:
             abort(400, description="status must be working/vacation/fired")
         with db_cursor() as (_, cur):
             cur.execute("UPDATE teachers SET status=%s WHERE id=%s", (status, teacher_id))
+            if status == "fired":
+                cur.execute("DELETE FROM branch_teachers WHERE teacher_id=%s", (teacher_id,))
             row = fetch_one(cur, "SELECT * FROM teachers WHERE id=%s", (teacher_id,))
         if not row:
             abort(404)
@@ -1383,7 +1493,7 @@ def create_app() -> Flask:
                 SELECT b.id, b.department_id, b.name, b.address, b.metro, b.is_active
                 FROM branch_teachers bt
                 JOIN branches b ON b.id=bt.branch_id
-                WHERE bt.teacher_id=%s
+                WHERE bt.teacher_id=%s AND b.is_active=1
                 ORDER BY b.name
                 """,
                 (teacher_id,),
@@ -1491,7 +1601,17 @@ def create_app() -> Flask:
             rows = fetch_all(
                 cur,
                 f"""
-                SELECT i.id, i.section_id, s.name AS section_name, i.name, i.description, i.pdf_filename, i.pdf_mime, i.created_at, i.updated_at
+                SELECT
+                    i.id,
+                    i.section_id,
+                    s.name AS section_name,
+                    i.name,
+                    i.description,
+                    i.pdf_filename,
+                    i.pdf_mime,
+                    i.created_at,
+                    i.updated_at,
+                    (i.photo_blob IS NOT NULL) AS has_photo
                 FROM instructions i
                 JOIN instruction_sections s ON s.id=i.section_id
                 WHERE {' AND '.join(where)}
@@ -1509,9 +1629,10 @@ def create_app() -> Flask:
         # Поддерживаем:
         # - multipart/form-data: file=... + section_id/name/description
         # - json: pdf_base64 + pdf_filename/pdf_mime
-        section_id = request.form.get("section_id") or (request.get_json(silent=True) or {}).get("section_id")
-        name = request.form.get("name") or (request.get_json(silent=True) or {}).get("name")
-        description = request.form.get("description") or (request.get_json(silent=True) or {}).get("description")
+        body_json = request.get_json(silent=True) or {}
+        section_id = request.form.get("section_id") or body_json.get("section_id")
+        name = request.form.get("name") or body_json.get("name")
+        description = request.form.get("description") or body_json.get("description")
 
         if section_id is None or not name:
             abort(400, description="section_id and name are required")
@@ -1519,6 +1640,9 @@ def create_app() -> Flask:
         pdf_bytes: bytes | None = None
         pdf_filename: str | None = None
         pdf_mime: str | None = None
+        photo_bytes: bytes | None = None
+        photo_filename: str | None = None
+        photo_mime: str | None = None
 
         if "file" in request.files:
             f = request.files["file"]
@@ -1526,31 +1650,83 @@ def create_app() -> Flask:
             pdf_filename = f.filename
             pdf_mime = f.mimetype or "application/pdf"
         else:
-            body = request.get_json(silent=True) or {}
-            b64 = body.get("pdf_base64")
+            b64 = body_json.get("pdf_base64")
             if not b64:
                 abort(400, description="Provide PDF file (multipart) or pdf_base64 (json)")
             pdf_bytes = base64.b64decode(b64)
-            pdf_filename = body.get("pdf_filename")
-            pdf_mime = body.get("pdf_mime") or "application/pdf"
+            pdf_filename = body_json.get("pdf_filename")
+            pdf_mime = body_json.get("pdf_mime") or "application/pdf"
 
         if not pdf_bytes:
             abort(400, description="Empty PDF")
         if len(pdf_bytes) > MAX_PDF_BYTES:
             abort(413, description=f"PDF too large (max {MAX_PDF_BYTES // (1024 * 1024)} MB)")
 
+        if "photo" in request.files:
+            pf = request.files["photo"]
+            photo_bytes = pf.read()
+            if not photo_bytes:
+                abort(400, description="Empty photo")
+            if len(photo_bytes) > MAX_PHOTO_BYTES:
+                abort(413, description=f"Photo too large (max {MAX_PHOTO_BYTES // (1024 * 1024)} MB)")
+            photo_filename = pf.filename
+            photo_mime = pf.mimetype or "image/jpeg"
+        else:
+            photo_b64 = body_json.get("photo_base64")
+            if photo_b64:
+                photo_bytes = base64.b64decode(photo_b64)
+                if not photo_bytes:
+                    abort(400, description="Empty photo")
+                if len(photo_bytes) > MAX_PHOTO_BYTES:
+                    abort(413, description=f"Photo too large (max {MAX_PHOTO_BYTES // (1024 * 1024)} MB)")
+                photo_filename = body_json.get("photo_filename")
+                photo_mime = body_json.get("photo_mime") or "image/jpeg"
+
         with db_cursor() as (_, cur):
             iid = exec_one(
                 cur,
                 """
-                INSERT INTO instructions(section_id, name, description, pdf_filename, pdf_mime, pdf_blob)
-                VALUES (%s,%s,%s,%s,%s,%s)
+                INSERT INTO instructions(
+                    section_id,
+                    name,
+                    description,
+                    photo_filename,
+                    photo_mime,
+                    photo_blob,
+                    pdf_filename,
+                    pdf_mime,
+                    pdf_blob
+                )
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
-                (int(section_id), str(name).strip(), description, pdf_filename, pdf_mime, pdf_bytes),
+                (
+                    int(section_id),
+                    str(name).strip(),
+                    description,
+                    photo_filename,
+                    photo_mime,
+                    photo_bytes,
+                    pdf_filename,
+                    pdf_mime,
+                    pdf_bytes,
+                ),
             )
             row = fetch_one(
                 cur,
-                "SELECT id, section_id, name, description, pdf_filename, pdf_mime, created_at, updated_at FROM instructions WHERE id=%s",
+                """
+                SELECT
+                    id,
+                    section_id,
+                    name,
+                    description,
+                    pdf_filename,
+                    pdf_mime,
+                    created_at,
+                    updated_at,
+                    (photo_blob IS NOT NULL) AS has_photo
+                FROM instructions
+                WHERE id=%s
+                """,
                 (iid,),
             )
         return _ok(row)
@@ -1562,7 +1738,16 @@ def create_app() -> Flask:
             row = fetch_one(
                 cur,
                 """
-                SELECT id, section_id, name, description, pdf_filename, pdf_mime, created_at, updated_at
+                SELECT
+                    id,
+                    section_id,
+                    name,
+                    description,
+                    pdf_filename,
+                    pdf_mime,
+                    created_at,
+                    updated_at,
+                    (photo_blob IS NOT NULL) AS has_photo
                 FROM instructions
                 WHERE id=%s
                 """,
@@ -1589,7 +1774,20 @@ def create_app() -> Flask:
             cur.execute(f"UPDATE instructions SET {', '.join(fields)} WHERE id=%s", tuple(params + [instruction_id]))
             row = fetch_one(
                 cur,
-                "SELECT id, section_id, name, description, pdf_filename, pdf_mime, created_at, updated_at FROM instructions WHERE id=%s",
+                """
+                SELECT
+                    id,
+                    section_id,
+                    name,
+                    description,
+                    pdf_filename,
+                    pdf_mime,
+                    created_at,
+                    updated_at,
+                    (photo_blob IS NOT NULL) AS has_photo
+                FROM instructions
+                WHERE id=%s
+                """,
                 (instruction_id,),
             )
         if not row:
@@ -1628,6 +1826,48 @@ def create_app() -> Flask:
             )
         return _ok({"updated": True})
 
+    @app.put(f"{API_BASE}/instructions/<int:instruction_id>/photo")
+    @require_auth
+    @require_role("OWNER")
+    def instructions_update_photo(instruction_id: int) -> Response:
+        if _parse_bool((request.get_json(silent=True) or {}).get("remove", False)):
+            with db_cursor() as (_, cur):
+                cur.execute(
+                    "UPDATE instructions SET photo_blob=NULL, photo_filename=NULL, photo_mime=NULL WHERE id=%s",
+                    (instruction_id,),
+                )
+            return _ok({"updated": True})
+
+        photo_bytes: bytes | None = None
+        photo_filename: str | None = None
+        photo_mime: str | None = None
+
+        if "photo" in request.files:
+            pf = request.files["photo"]
+            photo_bytes = pf.read()
+            photo_filename = pf.filename
+            photo_mime = pf.mimetype or "image/jpeg"
+        else:
+            body = request.get_json(silent=True) or {}
+            b64 = body.get("photo_base64")
+            if not b64:
+                abort(400, description="Provide photo file or photo_base64")
+            photo_bytes = base64.b64decode(b64)
+            photo_filename = body.get("photo_filename")
+            photo_mime = body.get("photo_mime") or "image/jpeg"
+
+        if not photo_bytes:
+            abort(400, description="Empty photo")
+        if len(photo_bytes) > MAX_PHOTO_BYTES:
+            abort(413, description=f"Photo too large (max {MAX_PHOTO_BYTES // (1024 * 1024)} MB)")
+
+        with db_cursor() as (_, cur):
+            cur.execute(
+                "UPDATE instructions SET photo_blob=%s, photo_filename=%s, photo_mime=%s WHERE id=%s",
+                (photo_bytes, photo_filename, photo_mime, instruction_id),
+            )
+        return _ok({"updated": True})
+
     @app.get(f"{API_BASE}/instructions/<int:instruction_id>/pdf")
     @require_auth
     def instructions_pdf(instruction_id: int) -> Response:
@@ -1647,6 +1887,28 @@ def create_app() -> Flask:
             mimetype=pdf_mime or "application/pdf",
             as_attachment=False,
             download_name=pdf_filename or f"instruction_{instruction_id}.pdf",
+            max_age=0,
+        )
+
+    @app.get(f"{API_BASE}/instructions/<int:instruction_id>/photo")
+    @require_auth
+    def instructions_photo(instruction_id: int) -> Response:
+        with db_cursor(dictionary=False) as (_, cur):
+            cur.execute("SELECT photo_blob, photo_mime, photo_filename FROM instructions WHERE id=%s", (instruction_id,))
+            row = cur.fetchone()
+        if not row:
+            abort(404)
+        photo_blob, photo_mime, photo_filename = row
+        if not photo_blob:
+            abort(404)
+        from io import BytesIO
+
+        bio = BytesIO(photo_blob)
+        return send_file(
+            bio,
+            mimetype=photo_mime or "image/jpeg",
+            as_attachment=False,
+            download_name=photo_filename or f"instruction_{instruction_id}.jpg",
             max_age=0,
         )
 
@@ -2550,6 +2812,239 @@ def create_app() -> Flask:
         if u.role == "TEACHER":
             return _ok({"items": [{"id": u.teacher_id, "self": True}]})
         return teachers_list()
+
+    # ------------------------------------------------------------
+    # Schedule (weekly plan)
+    # ------------------------------------------------------------
+    @app.get(f"{API_BASE}/schedules")
+    @require_auth
+    def schedules_list() -> Response:
+        u = _current_user()
+        args = dict(request.args)
+        department_id = args.get("department_id")
+        branch_id = args.get("branch_id")
+        weekday = args.get("weekday")
+
+        where: list[str] = ["1=1"]
+        params: list[Any] = []
+
+        if u.role == "OWNER":
+            if department_id:
+                where.append("b.department_id=%s")
+                params.append(int(department_id))
+            else:
+                scope_sql, scope_params = _lesson_owner_scope_sql(u.owner_id or 0)
+                where.append(scope_sql.replace("l.", "s."))
+                params.extend(scope_params)
+        else:
+            where.append(
+                """
+                EXISTS (
+                  SELECT 1 FROM branch_teachers bt
+                  WHERE bt.branch_id = s.branch_id AND bt.teacher_id = %s
+                )
+                """
+            )
+            params.append(u.teacher_id)
+
+        if branch_id:
+            where.append("s.branch_id=%s")
+            params.append(int(branch_id))
+        if weekday:
+            where.append("s.weekday=%s")
+            params.append(int(weekday))
+
+        sql = f"""
+            SELECT s.*, b.name AS branch_name, b.department_id, d.name AS department_name
+            FROM schedules s
+            JOIN branches b ON b.id = s.branch_id
+            JOIN departments d ON d.id = b.department_id
+            WHERE {' AND '.join(where)}
+            ORDER BY s.weekday, s.starts_at, s.id
+        """
+        with db_cursor() as (_, cur):
+            rows = fetch_all(cur, sql, tuple(params))
+
+            if rows:
+                branch_ids = sorted({int(r["branch_id"]) for r in rows})
+                placeholders = ",".join(["%s"] * len(branch_ids))
+                trows = fetch_all(
+                    cur,
+                    f"""
+                    SELECT bt.branch_id, t.id, t.full_name, t.color, t.status
+                    FROM branch_teachers bt
+                    JOIN teachers t ON t.id = bt.teacher_id
+                    WHERE bt.branch_id IN ({placeholders}) AND t.status = 'working'
+                    ORDER BY t.full_name
+                    """,
+                    tuple(branch_ids),
+                )
+            else:
+                trows = []
+
+        teachers_by_branch: dict[int, list[dict[str, Any]]] = {}
+        for tr in trows:
+            bid = int(tr["branch_id"])
+            teachers_by_branch.setdefault(bid, []).append(
+                {
+                    "id": tr["id"],
+                    "full_name": tr["full_name"],
+                    "color": tr["color"],
+                    "status": tr["status"],
+                }
+            )
+
+        for r in rows:
+            r["teachers"] = teachers_by_branch.get(int(r["branch_id"]), [])
+        return _ok({"items": rows})
+
+    @app.post(f"{API_BASE}/schedules")
+    @require_auth
+    @require_role("OWNER")
+    def schedules_create() -> Response:
+        u = _current_user()
+        body = request.get_json(silent=True) or {}
+        branch_id = body.get("branch_id")
+        weekday = body.get("weekday")
+        starts_at = body.get("starts_at")
+        duration_minutes = body.get("duration_minutes")
+
+        if branch_id is None or weekday is None or starts_at is None or duration_minutes is None:
+            abort(400, description="branch_id, weekday, starts_at, duration_minutes are required")
+
+        weekday_i = _parse_int("weekday", weekday, min_v=1, max_v=7)
+        duration_i = _parse_int("duration_minutes", duration_minutes, min_v=1, max_v=600)
+        starts_at_s = str(starts_at)
+        if len(starts_at_s.split(":")) < 2:
+            abort(400, description="starts_at must be HH:MM")
+
+        with db_cursor() as (_, cur):
+            ok = fetch_one(
+                cur,
+                """
+                SELECT 1
+                FROM branches b
+                JOIN department_owners do2 ON do2.department_id=b.department_id
+                WHERE b.id=%s AND do2.owner_id=%s
+                """,
+                (int(branch_id), u.owner_id),
+            )
+            if not ok:
+                abort(403, description="No access to branch")
+
+            sid = exec_one(
+                cur,
+                """
+                INSERT INTO schedules(branch_id, weekday, starts_at, duration_minutes)
+                VALUES (%s,%s,%s,%s)
+                """,
+                (int(branch_id), weekday_i, starts_at_s, duration_i),
+            )
+            row = fetch_one(
+                cur,
+                """
+                SELECT s.*, b.name AS branch_name, b.department_id, d.name AS department_name
+                FROM schedules s
+                JOIN branches b ON b.id=s.branch_id
+                JOIN departments d ON d.id=b.department_id
+                WHERE s.id=%s
+                """,
+                (sid,),
+            )
+        return _ok(row)
+
+    @app.put(f"{API_BASE}/schedules/<int:schedule_id>")
+    @require_auth
+    @require_role("OWNER")
+    def schedules_update(schedule_id: int) -> Response:
+        u = _current_user()
+        body = request.get_json(silent=True) or {}
+        fields: list[str] = []
+        params: list[Any] = []
+
+        if "branch_id" in body:
+            fields.append("branch_id=%s")
+            params.append(int(body.get("branch_id")))
+        if "weekday" in body:
+            fields.append("weekday=%s")
+            params.append(_parse_int("weekday", body.get("weekday"), min_v=1, max_v=7))
+        if "starts_at" in body:
+            starts_at_s = str(body.get("starts_at"))
+            if len(starts_at_s.split(":")) < 2:
+                abort(400, description="starts_at must be HH:MM")
+            fields.append("starts_at=%s")
+            params.append(starts_at_s)
+        if "duration_minutes" in body:
+            fields.append("duration_minutes=%s")
+            params.append(_parse_int("duration_minutes", body.get("duration_minutes"), min_v=1, max_v=600))
+
+        if not fields:
+            abort(400, description="No fields to update")
+
+        with db_cursor() as (_, cur):
+            ok = fetch_one(
+                cur,
+                """
+                SELECT 1
+                FROM schedules s
+                JOIN branches b ON b.id=s.branch_id
+                JOIN department_owners do2 ON do2.department_id=b.department_id
+                WHERE s.id=%s AND do2.owner_id=%s
+                """,
+                (schedule_id, u.owner_id),
+            )
+            if not ok:
+                abort(404)
+
+            if "branch_id" in body:
+                ok2 = fetch_one(
+                    cur,
+                    """
+                    SELECT 1
+                    FROM branches b
+                    JOIN department_owners do2 ON do2.department_id=b.department_id
+                    WHERE b.id=%s AND do2.owner_id=%s
+                    """,
+                    (int(body.get("branch_id")), u.owner_id),
+                )
+                if not ok2:
+                    abort(403, description="No access to branch")
+
+            cur.execute(f"UPDATE schedules SET {', '.join(fields)} WHERE id=%s", tuple(params + [schedule_id]))
+            row = fetch_one(
+                cur,
+                """
+                SELECT s.*, b.name AS branch_name, b.department_id, d.name AS department_name
+                FROM schedules s
+                JOIN branches b ON b.id=s.branch_id
+                JOIN departments d ON d.id=b.department_id
+                WHERE s.id=%s
+                """,
+                (schedule_id,),
+            )
+        return _ok(row)
+
+    @app.delete(f"{API_BASE}/schedules/<int:schedule_id>")
+    @require_auth
+    @require_role("OWNER")
+    def schedules_delete(schedule_id: int) -> Response:
+        u = _current_user()
+        with db_cursor() as (_, cur):
+            ok = fetch_one(
+                cur,
+                """
+                SELECT 1
+                FROM schedules s
+                JOIN branches b ON b.id=s.branch_id
+                JOIN department_owners do2 ON do2.department_id=b.department_id
+                WHERE s.id=%s AND do2.owner_id=%s
+                """,
+                (schedule_id, u.owner_id),
+            )
+            if not ok:
+                abort(404)
+            cur.execute("DELETE FROM schedules WHERE id=%s", (schedule_id,))
+        return _ok({"deleted": True})
 
     # ------------------------------------------------------------
     # Minimal OpenAPI stub (для дальнейшей документации)
