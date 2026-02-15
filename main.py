@@ -5,7 +5,7 @@ import json
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from functools import wraps
 from typing import Any, Callable, Iterator, Literal, TypeVar
@@ -1063,6 +1063,10 @@ def create_app() -> Flask:
         metro = body.get("metro")
         price = body.get("price_per_child")
         is_active = 1 if _parse_bool(body.get("is_active", True)) else 0
+        teacher_base_rate = body.get("teacher_base_rate")
+        if teacher_base_rate is None:
+            teacher_base_rate = 1200
+        teacher_base_rate = int(teacher_base_rate)
 
         if department_id is None or not name or not address or price is None:
             abort(400, description="department_id, name, address, price_per_child are required")
@@ -1079,10 +1083,10 @@ def create_app() -> Flask:
             bid = exec_one(
                 cur,
                 """
-                INSERT INTO branches(department_id, name, address, metro, price_per_child, is_active)
-                VALUES (%s,%s,%s,%s,%s,%s)
+                INSERT INTO branches(department_id, name, address, metro, price_per_child, is_active, teacher_base_rate)
+                VALUES (%s,%s,%s,%s,%s,%s,%s)
                 """,
-                (int(department_id), name, address, metro, price, is_active),
+                (int(department_id), name, address, metro, price, is_active, teacher_base_rate),
             )
             row = fetch_one(cur, "SELECT * FROM branches WHERE id=%s", (bid,))
         return _ok(row)
@@ -1095,11 +1099,13 @@ def create_app() -> Flask:
         body = request.get_json(silent=True) or {}
         fields: list[str] = []
         params: list[Any] = []
-        for k in ["name", "address", "metro", "price_per_child", "is_active"]:
+        for k in ["name", "address", "metro", "price_per_child", "is_active", "teacher_base_rate"]:
             if k in body:
                 fields.append(f"{k}=%s")
                 if k == "is_active":
                     params.append(1 if _parse_bool(body.get(k)) else 0)
+                elif k == "teacher_base_rate":
+                    params.append(int(body.get(k)))
                 else:
                     params.append(body.get(k))
         if not fields:
@@ -1490,9 +1496,10 @@ def create_app() -> Flask:
             rows = fetch_all(
                 cur,
                 """
-                SELECT b.id, b.department_id, b.name, b.address, b.metro, b.is_active
+                SELECT b.id, b.department_id, d.name AS department_name, b.name, b.address, b.metro, b.is_active
                 FROM branch_teachers bt
                 JOIN branches b ON b.id=bt.branch_id
+                LEFT JOIN departments d ON d.id=b.department_id
                 WHERE bt.teacher_id=%s AND b.is_active=1
                 ORDER BY b.name
                 """,
@@ -2680,6 +2687,156 @@ def create_app() -> Flask:
                 (u.teacher_id,),
             )
         return _ok({"kpi": kpi, "total": total_lessons})
+
+    # ------------------------------------------------------------
+    # Salary by department (TEACHER: my salary per department; OWNER: per department, per teacher)
+    # ------------------------------------------------------------
+    @app.get(f"{API_BASE}/salary/teacher-by-department")
+    @require_auth
+    @require_role("TEACHER")
+    def salary_teacher_by_department() -> Response:
+        u = _current_user()
+        args = dict(request.args)
+        where_sql, params = _dashboard_filters_sql(u, args)
+        with db_cursor() as (_, cur):
+            rows = fetch_all(
+                cur,
+                f"""
+                SELECT
+                  b.department_id,
+                  d.name AS department_name,
+                  COALESCE(SUM(l.teacher_salary),0) AS salary_sum,
+                  COALESCE(COUNT(*),0) AS lessons_count
+                FROM v_lessons_calc l
+                JOIN branches b ON b.id=l.branch_id
+                JOIN departments d ON d.id=b.department_id
+                WHERE {where_sql}
+                GROUP BY b.department_id, d.name
+                ORDER BY d.name
+                """,
+                tuple(params),
+            )
+            total_row = fetch_one(
+                cur,
+                f"""
+                SELECT COALESCE(SUM(l.teacher_salary),0) AS total_salary
+                FROM v_lessons_calc l
+                JOIN branches b ON b.id=l.branch_id
+                WHERE {where_sql}
+                """,
+                tuple(params),
+            )
+        total_salary = (total_row or {}).get("total_salary") or 0
+        return _ok({"total_salary": total_salary, "by_department": rows or []})
+
+    @app.get(f"{API_BASE}/salary/owner-by-department")
+    @require_auth
+    @require_role("OWNER")
+    def salary_owner_by_department() -> Response:
+        u = _current_user()
+        args = dict(request.args)
+        start, end = _parse_period(args)
+        where: list[str] = [
+            "EXISTS (SELECT 1 FROM branches b JOIN department_owners do2 ON do2.department_id=b.department_id WHERE b.id=l.branch_id AND do2.owner_id=%s)",
+        ]
+        params: list[Any] = [u.owner_id]
+        if start:
+            where.append("l.starts_at >= %s")
+            params.append(start.strftime("%Y-%m-%d %H:%M:%S"))
+        if end:
+            where.append("l.starts_at < %s")
+            params.append(end.strftime("%Y-%m-%d %H:%M:%S"))
+        where_sql = " AND ".join(where)
+        # Граница 16-го числа для разбивки 1–15 и 16–конец месяца
+        start_16 = (start + timedelta(days=15)) if start else None
+        start_fmt = start.strftime("%Y-%m-%d %H:%M:%S") if start else ""
+        start_16_fmt = start_16.strftime("%Y-%m-%d %H:%M:%S") if start_16 else ""
+        end_fmt = end.strftime("%Y-%m-%d %H:%M:%S") if end else ""
+        with db_cursor() as (_, cur):
+            # Разбивка по датам: 1–15 (starts_at < start_16), 16–конец (starts_at >= start_16)
+            if start and start_16 and end:
+                # Порядок %s в SQL: сначала 8 в SELECT (CASE), потом 3 в WHERE — параметры в том же порядке
+                params_ext = [
+                    start_fmt, start_16_fmt,  # salary_1_15
+                    start_fmt, start_16_fmt,  # lessons_1_15
+                    start_16_fmt, end_fmt,    # salary_16_end
+                    start_16_fmt, end_fmt,    # lessons_16_end
+                ] + list(params)
+                rows = fetch_all(
+                    cur,
+                    f"""
+                    SELECT
+                      b.department_id,
+                      d.name AS department_name,
+                      l.teacher_id,
+                      t.full_name AS teacher_name,
+                      COALESCE(SUM(l.teacher_salary),0) AS salary_sum,
+                      COALESCE(COUNT(*),0) AS lessons_count,
+                      COALESCE(SUM(CASE WHEN l.starts_at >= %s AND l.starts_at < %s THEN l.teacher_salary ELSE 0 END),0) AS salary_1_15,
+                      COALESCE(SUM(CASE WHEN l.starts_at >= %s AND l.starts_at < %s THEN 1 ELSE 0 END),0) AS lessons_1_15,
+                      COALESCE(SUM(CASE WHEN l.starts_at >= %s AND l.starts_at < %s THEN l.teacher_salary ELSE 0 END),0) AS salary_16_end,
+                      COALESCE(SUM(CASE WHEN l.starts_at >= %s AND l.starts_at < %s THEN 1 ELSE 0 END),0) AS lessons_16_end
+                    FROM v_lessons_calc l
+                    JOIN branches b ON b.id=l.branch_id
+                    JOIN departments d ON d.id=b.department_id
+                    JOIN teachers t ON t.id=l.teacher_id
+                    WHERE {where_sql}
+                    GROUP BY b.department_id, d.name, l.teacher_id, t.full_name
+                    ORDER BY d.name, t.full_name
+                    """,
+                    tuple(params_ext),
+                )
+            else:
+                rows = fetch_all(
+                    cur,
+                    f"""
+                    SELECT
+                      b.department_id,
+                      d.name AS department_name,
+                      l.teacher_id,
+                      t.full_name AS teacher_name,
+                      COALESCE(SUM(l.teacher_salary),0) AS salary_sum,
+                      COALESCE(COUNT(*),0) AS lessons_count,
+                      0 AS salary_1_15,
+                      0 AS lessons_1_15,
+                      0 AS salary_16_end,
+                      0 AS lessons_16_end
+                    FROM v_lessons_calc l
+                    JOIN branches b ON b.id=l.branch_id
+                    JOIN departments d ON d.id=b.department_id
+                    JOIN teachers t ON t.id=l.teacher_id
+                    WHERE {where_sql}
+                    GROUP BY b.department_id, d.name, l.teacher_id, t.full_name
+                    ORDER BY d.name, t.full_name
+                    """,
+                    tuple(params),
+                )
+        # Группируем по отделам
+        by_dep: dict[int, dict[str, Any]] = {}
+        for r in rows or []:
+            dep_id = int(r["department_id"])
+            if dep_id not in by_dep:
+                by_dep[dep_id] = {
+                    "department_id": dep_id,
+                    "department_name": r["department_name"],
+                    "teachers": [],
+                    "department_total": 0,
+                }
+            salary_sum = float(r["salary_sum"] or 0)
+            by_dep[dep_id]["teachers"].append({
+                "teacher_id": r["teacher_id"],
+                "teacher_name": r["teacher_name"],
+                "salary_sum": salary_sum,
+                "lessons_count": int(r["lessons_count"] or 0),
+                "salary_1_15": float(r["salary_1_15"] or 0),
+                "lessons_1_15": int(r["lessons_1_15"] or 0),
+                "salary_16_end": float(r["salary_16_end"] or 0),
+                "lessons_16_end": int(r["lessons_16_end"] or 0),
+            })
+            by_dep[dep_id]["department_total"] += salary_sum
+        result = list(by_dep.values())
+        result.sort(key=lambda x: (x["department_name"], x["department_id"]))
+        return _ok({"by_department": result})
 
     @app.get(f"{API_BASE}/reports/revenue-by-month")
     @require_auth
