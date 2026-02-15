@@ -3204,6 +3204,175 @@ def create_app() -> Flask:
         return _ok({"deleted": True})
 
     # ------------------------------------------------------------
+    # Teacher slots (свободные часы преподавателей по дням недели)
+    # ------------------------------------------------------------
+    @app.get(f"{API_BASE}/slots")
+    @require_auth
+    def slots_list() -> Response:
+        u = _current_user()
+        args = dict(request.args)
+        teacher_id_arg = args.get("teacher_id")
+        day_of_week_arg = args.get("day_of_week")
+
+        where: list[str] = ["1=1"]
+        params: list[Any] = []
+
+        if u.role == "TEACHER":
+            where.append("ts.teacher_id=%s")
+            params.append(u.teacher_id)
+        else:
+            if teacher_id_arg:
+                where.append("ts.teacher_id=%s")
+                params.append(int(teacher_id_arg))
+        if day_of_week_arg:
+            where.append("ts.day_of_week=%s")
+            params.append(int(day_of_week_arg))
+
+        sql = f"""
+            SELECT ts.id, ts.teacher_id, ts.day_of_week, ts.start_time, ts.created_at, ts.updated_at,
+                   t.full_name AS teacher_name, t.color AS teacher_color
+            FROM teacher_slots ts
+            JOIN teachers t ON t.id = ts.teacher_id
+            WHERE {' AND '.join(where)}
+            ORDER BY ts.day_of_week, ts.start_time, ts.id
+        """
+        with db_cursor() as (_, cur):
+            rows = fetch_all(cur, sql, tuple(params))
+        for r in rows:
+            if r.get("start_time"):
+                r["start_time"] = str(r["start_time"])[:5]
+        return _ok({"items": rows})
+
+    @app.post(f"{API_BASE}/slots")
+    @require_auth
+    def slots_create() -> Response:
+        u = _current_user()
+        body = request.get_json(silent=True) or {}
+        day_of_week = body.get("day_of_week")
+        start_time = body.get("start_time")
+
+        if day_of_week is None or start_time is None:
+            abort(400, description="day_of_week and start_time are required")
+
+        day_i = _parse_int("day_of_week", day_of_week, min_v=1, max_v=7)
+        start_time_s = str(start_time).strip()
+        if len(start_time_s.split(":")) < 2:
+            abort(400, description="start_time must be HH:MM or HH:MM:SS")
+
+        teacher_id: int
+        if u.role == "TEACHER":
+            teacher_id = u.teacher_id or 0
+            if not teacher_id:
+                abort(403, description="No teacher linked")
+        else:
+            tid = body.get("teacher_id")
+            if tid is not None:
+                teacher_id = int(tid)
+            else:
+                abort(400, description="For OWNER provide teacher_id")
+
+        with db_cursor() as (_, cur):
+            sid = exec_one(
+                cur,
+                "INSERT INTO teacher_slots(teacher_id, day_of_week, start_time) VALUES (%s,%s,%s)",
+                (teacher_id, day_i, start_time_s),
+            )
+            row = fetch_one(
+                cur,
+                """
+                SELECT ts.id, ts.teacher_id, ts.day_of_week, ts.start_time, ts.created_at, ts.updated_at,
+                       t.full_name AS teacher_name, t.color AS teacher_color
+                FROM teacher_slots ts
+                JOIN teachers t ON t.id = ts.teacher_id
+                WHERE ts.id=%s
+                """,
+                (sid,),
+            )
+        if row and row.get("start_time"):
+            row["start_time"] = str(row["start_time"])[:5]
+        return _ok(row)
+
+    @app.get(f"{API_BASE}/slots/<int:slot_id>")
+    @require_auth
+    def slots_get(slot_id: int) -> Response:
+        u = _current_user()
+        with db_cursor() as (_, cur):
+            row = fetch_one(
+                cur,
+                """
+                SELECT ts.id, ts.teacher_id, ts.day_of_week, ts.start_time, ts.created_at, ts.updated_at,
+                       t.full_name AS teacher_name, t.color AS teacher_color
+                FROM teacher_slots ts
+                JOIN teachers t ON t.id = ts.teacher_id
+                WHERE ts.id=%s
+                """,
+                (slot_id,),
+            )
+            if not row:
+                abort(404)
+            if u.role == "TEACHER" and u.teacher_id != row["teacher_id"]:
+                abort(404)
+        if row.get("start_time"):
+            row["start_time"] = str(row["start_time"])[:5]
+        return _ok(row)
+
+    @app.patch(f"{API_BASE}/slots/<int:slot_id>")
+    @require_auth
+    def slots_update(slot_id: int) -> Response:
+        u = _current_user()
+        body = request.get_json(silent=True) or {}
+        fields: list[str] = []
+        params: list[Any] = []
+
+        if "day_of_week" in body:
+            fields.append("day_of_week=%s")
+            params.append(_parse_int("day_of_week", body.get("day_of_week"), min_v=1, max_v=7))
+        if "start_time" in body:
+            start_time_s = str(body.get("start_time")).strip()
+            if len(start_time_s.split(":")) < 2:
+                abort(400, description="start_time must be HH:MM or HH:MM:SS")
+            fields.append("start_time=%s")
+            params.append(start_time_s)
+
+        if not fields:
+            abort(400, description="No fields to update")
+
+        with db_cursor() as (_, cur):
+            existing = fetch_one(cur, "SELECT teacher_id FROM teacher_slots WHERE id=%s", (slot_id,))
+            if not existing:
+                abort(404)
+            if u.role == "TEACHER" and u.teacher_id != existing["teacher_id"]:
+                abort(404)
+            cur.execute(f"UPDATE teacher_slots SET {', '.join(fields)} WHERE id=%s", tuple(params + [slot_id]))
+            row = fetch_one(
+                cur,
+                """
+                SELECT ts.id, ts.teacher_id, ts.day_of_week, ts.start_time, ts.created_at, ts.updated_at,
+                       t.full_name AS teacher_name, t.color AS teacher_color
+                FROM teacher_slots ts
+                JOIN teachers t ON t.id = ts.teacher_id
+                WHERE ts.id=%s
+                """,
+                (slot_id,),
+            )
+        if row and row.get("start_time"):
+            row["start_time"] = str(row["start_time"])[:5]
+        return _ok(row)
+
+    @app.delete(f"{API_BASE}/slots/<int:slot_id>")
+    @require_auth
+    def slots_delete(slot_id: int) -> Response:
+        u = _current_user()
+        with db_cursor() as (_, cur):
+            existing = fetch_one(cur, "SELECT teacher_id FROM teacher_slots WHERE id=%s", (slot_id,))
+            if not existing:
+                abort(404)
+            if u.role == "TEACHER" and u.teacher_id != existing["teacher_id"]:
+                abort(404)
+            cur.execute("DELETE FROM teacher_slots WHERE id=%s", (slot_id,))
+        return _ok({"deleted": True})
+
+    # ------------------------------------------------------------
     # Minimal OpenAPI stub (для дальнейшей документации)
     # ------------------------------------------------------------
     @app.get(f"{API_BASE}/openapi.json")
