@@ -3228,19 +3228,38 @@ def create_app() -> Flask:
             where.append("ts.day_of_week=%s")
             params.append(int(day_of_week_arg))
 
-        sql = f"""
-            SELECT ts.id, ts.teacher_id, ts.day_of_week, ts.start_time, ts.created_at, ts.updated_at,
-                   t.full_name AS teacher_name, t.color AS teacher_color
-            FROM teacher_slots ts
-            JOIN teachers t ON t.id = ts.teacher_id
-            WHERE {' AND '.join(where)}
-            ORDER BY ts.day_of_week, ts.start_time, ts.id
-        """
+        if u.role == "OWNER" and u.owner_id:
+            owner_id = u.owner_id
+            sql = f"""
+                SELECT ts.id, ts.teacher_id, ts.day_of_week, ts.start_time, ts.status, ts.occupied_by_department_id,
+                       ts.created_at, ts.updated_at,
+                       t.full_name AS teacher_name, t.color AS teacher_color,
+                       (SELECT d.name FROM departments d
+                        INNER JOIN department_owners do ON do.department_id = d.id AND do.owner_id = %s
+                        WHERE d.id = ts.occupied_by_department_id LIMIT 1) AS occupied_by_department_name
+                FROM teacher_slots ts
+                JOIN teachers t ON t.id = ts.teacher_id
+                WHERE {' AND '.join(where)}
+                ORDER BY ts.day_of_week, ts.start_time, ts.id
+            """
+            params = list(params) + [owner_id]
+        else:
+            sql = f"""
+                SELECT ts.id, ts.teacher_id, ts.day_of_week, ts.start_time, ts.status, ts.occupied_by_department_id,
+                       ts.created_at, ts.updated_at,
+                       t.full_name AS teacher_name, t.color AS teacher_color
+                FROM teacher_slots ts
+                JOIN teachers t ON t.id = ts.teacher_id
+                WHERE {' AND '.join(where)}
+                ORDER BY ts.day_of_week, ts.start_time, ts.id
+            """
         with db_cursor() as (_, cur):
             rows = fetch_all(cur, sql, tuple(params))
         for r in rows:
             if r.get("start_time"):
                 r["start_time"] = str(r["start_time"])[:5]
+            if r.get("occupied_by_department_id") is None:
+                r["occupied_by_department_name"] = None
         return _ok({"items": rows})
 
     @app.post(f"{API_BASE}/slots")
@@ -3271,16 +3290,31 @@ def create_app() -> Flask:
             else:
                 abort(400, description="For OWNER provide teacher_id")
 
+        status = (body.get("status") or "free").strip().lower()
+        if status not in ("free", "occupied"):
+            status = "free"
+        occupied_by_department_id = body.get("occupied_by_department_id")
+        if u.role == "TEACHER":
+            occupied_by_department_id = None
+        elif u.role == "OWNER" and occupied_by_department_id is not None:
+            occupied_by_department_id = int(occupied_by_department_id)
+            dep_ids = _owner_department_ids(u.owner_id or 0)
+            if dep_ids and occupied_by_department_id not in dep_ids:
+                occupied_by_department_id = None
+        else:
+            occupied_by_department_id = None
+
         with db_cursor() as (_, cur):
             sid = exec_one(
                 cur,
-                "INSERT INTO teacher_slots(teacher_id, day_of_week, start_time) VALUES (%s,%s,%s)",
-                (teacher_id, day_i, start_time_s),
+                "INSERT INTO teacher_slots(teacher_id, day_of_week, start_time, status, occupied_by_department_id) VALUES (%s,%s,%s,%s,%s)",
+                (teacher_id, day_i, start_time_s, status, occupied_by_department_id),
             )
             row = fetch_one(
                 cur,
                 """
-                SELECT ts.id, ts.teacher_id, ts.day_of_week, ts.start_time, ts.created_at, ts.updated_at,
+                SELECT ts.id, ts.teacher_id, ts.day_of_week, ts.start_time, ts.status, ts.occupied_by_department_id,
+                       ts.created_at, ts.updated_at,
                        t.full_name AS teacher_name, t.color AS teacher_color
                 FROM teacher_slots ts
                 JOIN teachers t ON t.id = ts.teacher_id
@@ -3297,17 +3331,35 @@ def create_app() -> Flask:
     def slots_get(slot_id: int) -> Response:
         u = _current_user()
         with db_cursor() as (_, cur):
-            row = fetch_one(
-                cur,
-                """
-                SELECT ts.id, ts.teacher_id, ts.day_of_week, ts.start_time, ts.created_at, ts.updated_at,
-                       t.full_name AS teacher_name, t.color AS teacher_color
-                FROM teacher_slots ts
-                JOIN teachers t ON t.id = ts.teacher_id
-                WHERE ts.id=%s
-                """,
-                (slot_id,),
-            )
+            if u.role == "OWNER" and u.owner_id:
+                row = fetch_one(
+                    cur,
+                    """
+                    SELECT ts.id, ts.teacher_id, ts.day_of_week, ts.start_time, ts.status, ts.occupied_by_department_id,
+                           ts.created_at, ts.updated_at,
+                           t.full_name AS teacher_name, t.color AS teacher_color,
+                           (SELECT d.name FROM departments d
+                            INNER JOIN department_owners do ON do.department_id = d.id AND do.owner_id = %s
+                            WHERE d.id = ts.occupied_by_department_id LIMIT 1) AS occupied_by_department_name
+                    FROM teacher_slots ts
+                    JOIN teachers t ON t.id = ts.teacher_id
+                    WHERE ts.id=%s
+                    """,
+                    (u.owner_id, slot_id),
+                )
+            else:
+                row = fetch_one(
+                    cur,
+                    """
+                    SELECT ts.id, ts.teacher_id, ts.day_of_week, ts.start_time, ts.status, ts.occupied_by_department_id,
+                           ts.created_at, ts.updated_at,
+                           t.full_name AS teacher_name, t.color AS teacher_color
+                    FROM teacher_slots ts
+                    JOIN teachers t ON t.id = ts.teacher_id
+                    WHERE ts.id=%s
+                    """,
+                    (slot_id,),
+                )
             if not row:
                 abort(404)
             if u.role == "TEACHER" and u.teacher_id != row["teacher_id"]:
@@ -3333,6 +3385,29 @@ def create_app() -> Flask:
                 abort(400, description="start_time must be HH:MM or HH:MM:SS")
             fields.append("start_time=%s")
             params.append(start_time_s)
+        if "status" in body:
+            status = str(body.get("status")).strip().lower()
+            if status not in ("free", "occupied"):
+                abort(400, description="status must be free or occupied")
+            fields.append("status=%s")
+            params.append(status)
+            if status == "free":
+                fields.append("occupied_by_department_id=NULL")
+        if "occupied_by_department_id" in body:
+            if u.role == "TEACHER":
+                abort(400, description="TEACHER cannot set occupied_by_department_id")
+            already_null_from_status = "status" in body and str(body.get("status")).strip().lower() == "free"
+            if not already_null_from_status:
+                val = body.get("occupied_by_department_id")
+                if val is None or val == "":
+                    fields.append("occupied_by_department_id=NULL")
+                else:
+                    dep_id = int(val)
+                    dep_ids = _owner_department_ids(u.owner_id or 0)
+                    if dep_id not in dep_ids:
+                        abort(403, description="Not your department")
+                    fields.append("occupied_by_department_id=%s")
+                    params.append(dep_id)
 
         if not fields:
             abort(400, description="No fields to update")
@@ -3344,17 +3419,35 @@ def create_app() -> Flask:
             if u.role == "TEACHER" and u.teacher_id != existing["teacher_id"]:
                 abort(404)
             cur.execute(f"UPDATE teacher_slots SET {', '.join(fields)} WHERE id=%s", tuple(params + [slot_id]))
-            row = fetch_one(
-                cur,
-                """
-                SELECT ts.id, ts.teacher_id, ts.day_of_week, ts.start_time, ts.created_at, ts.updated_at,
-                       t.full_name AS teacher_name, t.color AS teacher_color
-                FROM teacher_slots ts
-                JOIN teachers t ON t.id = ts.teacher_id
-                WHERE ts.id=%s
-                """,
-                (slot_id,),
-            )
+            if u.role == "OWNER" and u.owner_id:
+                row = fetch_one(
+                    cur,
+                    """
+                    SELECT ts.id, ts.teacher_id, ts.day_of_week, ts.start_time, ts.status, ts.occupied_by_department_id,
+                           ts.created_at, ts.updated_at,
+                           t.full_name AS teacher_name, t.color AS teacher_color,
+                           (SELECT d.name FROM departments d
+                            INNER JOIN department_owners do ON do.department_id = d.id AND do.owner_id = %s
+                            WHERE d.id = ts.occupied_by_department_id LIMIT 1) AS occupied_by_department_name
+                    FROM teacher_slots ts
+                    JOIN teachers t ON t.id = ts.teacher_id
+                    WHERE ts.id=%s
+                    """,
+                    (u.owner_id, slot_id),
+                )
+            else:
+                row = fetch_one(
+                    cur,
+                    """
+                    SELECT ts.id, ts.teacher_id, ts.day_of_week, ts.start_time, ts.status, ts.occupied_by_department_id,
+                           ts.created_at, ts.updated_at,
+                           t.full_name AS teacher_name, t.color AS teacher_color
+                    FROM teacher_slots ts
+                    JOIN teachers t ON t.id = ts.teacher_id
+                    WHERE ts.id=%s
+                    """,
+                    (slot_id,),
+                )
         if row and row.get("start_time"):
             row["start_time"] = str(row["start_time"])[:5]
         return _ok(row)
