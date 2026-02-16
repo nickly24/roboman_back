@@ -3,6 +3,11 @@ from __future__ import annotations
 import base64
 import json
 import os
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -42,6 +47,10 @@ DB_POOL_SIZE = 10
 # Upload limits
 MAX_PDF_BYTES = 10 * 1024 * 1024  # 10 MB
 MAX_PHOTO_BYTES = 5 * 1024 * 1024  # 5 MB
+
+# Какой токен бота использовать. Одна БД на прод и дев — переключатель только тут в коде.
+# "prod" → telegram_bot_token, "dev" → telegram_bot_token_dev
+TELEGRAM_BOT_ENV = "prod"
 
 
 # ------------------------------------------------------------
@@ -130,6 +139,105 @@ def fetch_all(cur: Any, sql: str, params: tuple[Any, ...] = ()) -> list[Any]:
 def exec_one(cur: Any, sql: str, params: tuple[Any, ...] = ()) -> int:
     cur.execute(sql, params)
     return int(getattr(cur, "lastrowid", 0) or 0)
+
+
+# ------------------------------------------------------------
+# Telegram CRM helpers (модульный уровень для бота в потоке)
+# ------------------------------------------------------------
+
+def _get_telegram_token_from_settings() -> str | None:
+    """Берёт токен из БД: ключ зависит от TELEGRAM_BOT_ENV вверху main.py (prod → telegram_bot_token, dev → telegram_bot_token_dev)."""
+    env = (TELEGRAM_BOT_ENV or "prod").strip().lower()
+    key = "telegram_bot_token_dev" if env == "dev" else "telegram_bot_token"
+    with db_cursor() as (_, cur):
+        row = fetch_one(cur, "SELECT value_text FROM settings WHERE `key`=%s", (key,))
+        if not row or not row.get("value_text"):
+            return None
+        return str(row["value_text"]).strip() or None
+
+
+def telegram_send_message(token: str, chat_id: int, text: str) -> bool:
+    """Отправить сообщение в Telegram. Возвращает True при успехе."""
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = json.dumps({"chat_id": chat_id, "text": text}).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method="POST", headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return 200 <= resp.status < 300
+    except Exception:
+        return False
+
+
+def _telegram_bot_poll_loop() -> None:
+    """Фоновый цикл long polling Telegram. Запускать в отдельном потоке."""
+    offset: int | None = None
+    while True:
+        try:
+            token = _get_telegram_token_from_settings()
+            if not token:
+                time.sleep(60)
+                continue
+            url = f"https://api.telegram.org/bot{token}/getUpdates?timeout=30"
+            if offset is not None:
+                url += f"&offset={offset}"
+            req = urllib.request.Request(url, method="GET")
+            with urllib.request.urlopen(req, timeout=35) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            if not data.get("ok"):
+                time.sleep(2)
+                continue
+            updates = data.get("result") or []
+            for upd in updates:
+                offset = int(upd["update_id"]) + 1
+                msg = upd.get("message") or upd.get("edited_message")
+                if not msg:
+                    continue
+                chat_id = msg.get("chat", {}).get("id")
+                text = (msg.get("text") or "").strip()
+                tg_message_id = msg.get("message_id")
+                is_edit = "edited_message" in upd
+
+                with db_cursor() as (conn, cur):
+                    if is_edit and tg_message_id:
+                        cur.execute(
+                            "UPDATE crm_messages SET content=%s, updated_at=NOW() WHERE telegram_message_id=%s",
+                            (text or "", tg_message_id),
+                        )
+                    else:
+                        row = fetch_one(
+                            cur,
+                            """
+                            SELECT cc.id AS crm_chat_id, cc.display_name, b.name AS branch_name
+                            FROM crm_chats cc
+                            JOIN branches b ON b.id = cc.branch_id
+                            WHERE cc.telegram_chat_id=%s
+                            """,
+                            (chat_id,),
+                        )
+                        if row:
+                            exec_one(
+                                cur,
+                                "INSERT INTO crm_messages (crm_chat_id, direction, content, telegram_message_id, sent_by_user_id) VALUES (%s,'in',%s,%s,NULL)",
+                                (row["crm_chat_id"], text or "", tg_message_id),
+                            )
+                            label = row["display_name"] or row["branch_name"] or str(chat_id)
+                            notif_text = f"Новое сообщение в CRM ({label}): { (text[:80] + '…') if text and len(text) > 80 else (text or '') }"
+                            subs = fetch_all(cur, "SELECT telegram_chat_id FROM crm_notification_subscribers")
+                            for s in subs:
+                                try:
+                                    telegram_send_message(token, int(s["telegram_chat_id"]), notif_text)
+                                except Exception:
+                                    pass
+                        else:
+                            if (text or "").lower() in ("/start", "start", "старт"):
+                                reply = f"Ваш chat_id: {chat_id}. Отправьте его руководителю IT-клуба для регистрации в CRM."
+                                telegram_send_message(token, chat_id, reply)
+        except urllib.error.HTTPError as e:
+            if e.code == 401:
+                offset = None
+            time.sleep(5)
+        except Exception:
+            time.sleep(5)
 
 
 # ------------------------------------------------------------
@@ -222,6 +330,23 @@ def require_role(*allowed: Role) -> Callable[[F], F]:
         return wrapper  # type: ignore[return-value]
 
     return deco
+
+
+def require_crm_access(fn: F) -> F:
+    """OWNER с флагом crm_access=1."""
+    @wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        u: CurrentUser = getattr(g, "current_user", None) or get_current_user()
+        g.current_user = u
+        if u.role != "OWNER":
+            abort(403, description="CRM access only for owners")
+        with db_cursor() as (_, cur):
+            row = fetch_one(cur, "SELECT crm_access FROM auf_users WHERE id=%s", (u.id,))
+            if not row or int(row.get("crm_access") or 0) != 1:
+                abort(403, description="CRM access not granted")
+        return fn(*args, **kwargs)
+
+    return wrapper  # type: ignore[return-value]
 
 
 # ------------------------------------------------------------
@@ -451,7 +576,7 @@ def create_app() -> Flask:
         with db_cursor() as (_, cur):
             user = fetch_one(
                 cur,
-                "SELECT id, login, password_hash, role, owner_id, teacher_id, is_active FROM auf_users WHERE login=%s",
+                "SELECT id, login, password_hash, role, owner_id, teacher_id, is_active, crm_access FROM auf_users WHERE login=%s",
                 (login,),
             )
             if not user:
@@ -484,7 +609,7 @@ def create_app() -> Flask:
         with db_cursor() as (_, cur):
             user = fetch_one(
                 cur,
-                "SELECT id, login, role, owner_id, teacher_id, is_active, created_at, updated_at FROM auf_users WHERE id=%s",
+                "SELECT id, login, role, owner_id, teacher_id, is_active, crm_access, created_at, updated_at FROM auf_users WHERE id=%s",
                 (u.id,),
             )
             profile = None
@@ -529,7 +654,7 @@ def create_app() -> Flask:
             params.append(f"%{q}%")
 
         sql = f"""
-            SELECT id, login, role, owner_id, teacher_id, is_active, created_at, updated_at
+            SELECT id, login, role, owner_id, teacher_id, is_active, crm_access, created_at, updated_at
             FROM auf_users
             WHERE {' AND '.join(where)}
             ORDER BY id DESC
@@ -585,7 +710,7 @@ def create_app() -> Flask:
         with db_cursor() as (_, cur):
             row = fetch_one(
                 cur,
-                "SELECT id, login, role, owner_id, teacher_id, is_active, created_at, updated_at FROM auf_users WHERE id=%s",
+                "SELECT id, login, role, owner_id, teacher_id, is_active, crm_access, created_at, updated_at FROM auf_users WHERE id=%s",
                 (user_id,),
             )
         if not row:
@@ -608,6 +733,13 @@ def create_app() -> Flask:
         if "is_active" in body:
             fields.append("is_active=%s")
             params.append(1 if _parse_bool(body.get("is_active")) else 0)
+        if "crm_access" in body:
+            with db_cursor() as (_, cur):
+                existing = fetch_one(cur, "SELECT role FROM auf_users WHERE id=%s", (user_id,))
+                if existing and existing.get("role") != "OWNER":
+                    abort(400, description="crm_access only for OWNER users")
+            fields.append("crm_access=%s")
+            params.append(1 if _parse_bool(body.get("crm_access")) else 0)
         if not fields:
             abort(400, description="No fields to update")
 
@@ -616,7 +748,7 @@ def create_app() -> Flask:
             cur.execute(f"UPDATE auf_users SET {', '.join(fields)} WHERE id=%s", tuple(params))
             row = fetch_one(
                 cur,
-                "SELECT id, login, role, owner_id, teacher_id, is_active, created_at, updated_at FROM auf_users WHERE id=%s",
+                "SELECT id, login, role, owner_id, teacher_id, is_active, crm_access, created_at, updated_at FROM auf_users WHERE id=%s",
                 (user_id,),
             )
         if not row:
@@ -3466,6 +3598,500 @@ def create_app() -> Flask:
         return _ok({"deleted": True})
 
     # ------------------------------------------------------------
+    # CRM + Telegram (доступ: OWNER с crm_access=1)
+    # ------------------------------------------------------------
+    @app.get(f"{API_BASE}/crm/branches")
+    @require_auth
+    @require_crm_access
+    def crm_branches_list() -> Response:
+        with db_cursor() as (_, cur):
+            rows = fetch_all(
+                cur,
+                """
+                SELECT cb.branch_id, cb.created_at AS crm_added_at,
+                       b.name, b.address, b.metro, b.department_id, b.is_active
+                FROM crm_branches cb
+                JOIN branches b ON b.id = cb.branch_id
+                ORDER BY b.name
+                """,
+            )
+            for r in rows:
+                r["crm_added_at"] = r["crm_added_at"].isoformat() if r.get("crm_added_at") else None
+        return _ok({"items": rows})
+
+    @app.post(f"{API_BASE}/crm/branches")
+    @require_auth
+    @require_crm_access
+    def crm_branches_add() -> Response:
+        body = request.get_json(silent=True) or {}
+        branch_id = body.get("branch_id")
+        if branch_id is None:
+            abort(400, description="branch_id is required")
+        branch_id = int(branch_id)
+        with db_cursor() as (_, cur):
+            ok = fetch_one(cur, "SELECT id FROM branches WHERE id=%s", (branch_id,))
+            if not ok:
+                abort(404, description="Branch not found")
+            try:
+                exec_one(cur, "INSERT INTO crm_branches (branch_id) VALUES (%s)", (branch_id,))
+            except MySQLError as e:
+                if "Duplicate" in str(e):
+                    abort(400, description="Branch already in CRM")
+                raise
+            row = fetch_one(cur, "SELECT branch_id, created_at FROM crm_branches WHERE branch_id=%s", (branch_id,))
+        row["created_at"] = row["created_at"].isoformat() if row.get("created_at") else None
+        return _ok(row)
+
+    @app.delete(f"{API_BASE}/crm/branches/<int:branch_id>")
+    @require_auth
+    @require_crm_access
+    def crm_branches_remove(branch_id: int) -> Response:
+        with db_cursor() as (_, cur):
+            cur.execute("DELETE FROM crm_branches WHERE branch_id=%s", (branch_id,))
+            if cur.rowcount == 0:
+                abort(404)
+        return _ok({"deleted": True})
+
+    def _crm_chats_enrich_with_last_and_unread(cur: Any, rows: list[dict], user_id: int) -> None:
+        if not rows:
+            return
+        chat_ids = [int(r["id"]) for r in rows]
+        placeholders = ",".join(["%s"] * len(chat_ids))
+        last_msgs = fetch_all(
+            cur,
+            f"""
+            SELECT m.crm_chat_id, m.id AS last_id, LEFT(m.content, 80) AS last_preview, m.created_at AS last_at, m.direction AS last_direction, m.sent_by_user_id AS last_sent_by
+            FROM crm_messages m
+            INNER JOIN (SELECT crm_chat_id, MAX(id) AS mid FROM crm_messages GROUP BY crm_chat_id) t
+              ON m.crm_chat_id = t.crm_chat_id AND m.id = t.mid
+            WHERE m.crm_chat_id IN ({placeholders})
+            """,
+            tuple(chat_ids),
+        )
+        last_by_chat = {int(x["crm_chat_id"]): x for x in last_msgs}
+        read_state = fetch_all(
+            cur,
+            f"SELECT crm_chat_id, last_read_message_id FROM crm_chat_read_state WHERE user_id=%s AND crm_chat_id IN ({placeholders})",
+            (user_id, *chat_ids),
+        )
+        read_by_chat = {int(x["crm_chat_id"]): (x["last_read_message_id"] or 0) for x in read_state}
+        unread_rows = fetch_all(
+            cur,
+            f"""
+            SELECT m.crm_chat_id,
+                   SUM(CASE WHEN m.direction='in' THEN 1 ELSE 0 END) AS unread_from_client,
+                   SUM(CASE WHEN m.direction='out' AND (m.sent_by_user_id IS NULL OR m.sent_by_user_id != %s) THEN 1 ELSE 0 END) AS unread_from_team
+            FROM crm_messages m
+            LEFT JOIN crm_chat_read_state r ON r.crm_chat_id = m.crm_chat_id AND r.user_id = %s
+            WHERE m.crm_chat_id IN ({placeholders}) AND m.id > COALESCE(r.last_read_message_id, 0)
+            GROUP BY m.crm_chat_id
+            """,
+            (user_id, user_id, *chat_ids),
+        )
+        unread_by_chat = {int(x["crm_chat_id"]): (int(x["unread_from_client"] or 0), int(x["unread_from_team"] or 0)) for x in unread_rows}
+        for r in rows:
+            cid = int(r["id"])
+            lm = last_by_chat.get(cid)
+            if lm:
+                r["last_message"] = {
+                    "id": lm["last_id"],
+                    "content_preview": (lm["last_preview"] or "")[:80],
+                    "created_at": lm["last_at"].isoformat() if lm.get("last_at") else None,
+                    "direction": lm["last_direction"],
+                    "sent_by_user_id": lm.get("last_sent_by"),
+                }
+            else:
+                r["last_message"] = None
+            u = unread_by_chat.get(cid, (0, 0))
+            r["unread_from_client"] = u[0]
+            r["unread_from_team"] = u[1]
+
+    @app.get(f"{API_BASE}/crm/branches/<int:branch_id>/chats")
+    @require_auth
+    @require_crm_access
+    def crm_branch_chats(branch_id: int) -> Response:
+        u = _current_user()
+        with db_cursor() as (_, cur):
+            ok = fetch_one(cur, "SELECT 1 FROM crm_branches WHERE branch_id=%s", (branch_id,))
+            if not ok:
+                abort(404)
+            rows = fetch_all(
+                cur,
+                "SELECT id, branch_id, telegram_chat_id, display_name, created_at, updated_at FROM crm_chats WHERE branch_id=%s ORDER BY id",
+                (branch_id,),
+            )
+            for r in rows:
+                for k in ("created_at", "updated_at"):
+                    if r.get(k):
+                        r[k] = r[k].isoformat()
+            _crm_chats_enrich_with_last_and_unread(cur, rows, u.id)
+        return _ok({"items": rows})
+
+    @app.get(f"{API_BASE}/crm/chats")
+    @require_auth
+    @require_crm_access
+    def crm_chats_list() -> Response:
+        u = _current_user()
+        args = dict(request.args)
+        branch_id = args.get("branch_id")
+        with db_cursor() as (_, cur):
+            where = "1=1"
+            params: list[Any] = []
+            if branch_id is not None:
+                where += " AND cc.branch_id=%s"
+                params.append(int(branch_id))
+            rows = fetch_all(
+                cur,
+                f"""
+                SELECT cc.id, cc.branch_id, cc.telegram_chat_id, cc.display_name, cc.created_at, cc.updated_at,
+                       b.name AS branch_name, b.address AS branch_address
+                FROM crm_chats cc
+                JOIN branches b ON b.id = cc.branch_id
+                JOIN crm_branches cb ON cb.branch_id = cc.branch_id
+                WHERE {where}
+                ORDER BY b.name, cc.id
+                """,
+                tuple(params),
+            )
+            for r in rows:
+                for k in ("created_at", "updated_at"):
+                    if r.get(k):
+                        r[k] = r[k].isoformat()
+            _crm_chats_enrich_with_last_and_unread(cur, rows, u.id)
+        return _ok({"items": rows})
+
+    @app.post(f"{API_BASE}/crm/chats")
+    @require_auth
+    @require_crm_access
+    def crm_chats_create() -> Response:
+        u = _current_user()
+        body = request.get_json(silent=True) or {}
+        branch_id = body.get("branch_id")
+        telegram_chat_id = body.get("telegram_chat_id")
+        display_name = (body.get("display_name") or "").strip() or None
+        if branch_id is None or telegram_chat_id is None:
+            abort(400, description="branch_id and telegram_chat_id are required")
+        branch_id = int(branch_id)
+        try:
+            telegram_chat_id = int(telegram_chat_id)
+        except (TypeError, ValueError):
+            abort(400, description="telegram_chat_id must be integer")
+        with db_cursor() as (_, cur):
+            ok = fetch_one(cur, "SELECT 1 FROM crm_branches WHERE branch_id=%s", (branch_id,))
+            if not ok:
+                abort(400, description="Branch not in CRM")
+            branch_row = fetch_one(cur, "SELECT name, address FROM branches WHERE id=%s", (branch_id,))
+            try:
+                cid = exec_one(
+                    cur,
+                    "INSERT INTO crm_chats (branch_id, telegram_chat_id, display_name) VALUES (%s,%s,%s)",
+                    (branch_id, telegram_chat_id, display_name),
+                )
+            except MySQLError as e:
+                if "Duplicate" in str(e):
+                    abort(400, description="This chat_id already linked to this branch")
+                raise
+            row = fetch_one(
+                cur,
+                "SELECT id, branch_id, telegram_chat_id, display_name, created_at, updated_at FROM crm_chats WHERE id=%s",
+                (cid,),
+            )
+        for k in ("created_at", "updated_at"):
+            if row.get(k):
+                row[k] = row[k].isoformat()
+        token = _get_telegram_token_from_settings()
+        if token and branch_row:
+            msg = f"Вы зарегистрированы. Филиал: {branch_row['name']}. Адрес: {branch_row['address'] or '—'}."
+            telegram_send_message(token, telegram_chat_id, msg)
+        return _ok(row)
+
+    @app.post(f"{API_BASE}/crm/chats/<int:chat_id>/read")
+    @require_auth
+    @require_crm_access
+    def crm_chats_read(chat_id: int) -> Response:
+        u = _current_user()
+        body = request.get_json(silent=True) or {}
+        last_message_id = body.get("last_message_id")
+        if last_message_id is None:
+            abort(400, description="last_message_id is required")
+        last_message_id = int(last_message_id)
+        with db_cursor() as (_, cur):
+            ok = fetch_one(cur, "SELECT id FROM crm_chats WHERE id=%s", (chat_id,))
+            if not ok:
+                abort(404)
+            cur.execute(
+                """
+                INSERT INTO crm_chat_read_state (user_id, crm_chat_id, last_read_message_id)
+                VALUES (%s, %s, %s)
+                ON DUPLICATE KEY UPDATE last_read_message_id = GREATEST(COALESCE(last_read_message_id, 0), %s)
+                """,
+                (u.id, chat_id, last_message_id, last_message_id),
+            )
+        return _ok({"ok": True})
+
+    @app.get(f"{API_BASE}/crm/chats/<int:chat_id>")
+    @require_auth
+    @require_crm_access
+    def crm_chats_get(chat_id: int) -> Response:
+        with db_cursor() as (_, cur):
+            row = fetch_one(
+                cur,
+                """
+                SELECT cc.id, cc.branch_id, cc.telegram_chat_id, cc.display_name, cc.created_at, cc.updated_at,
+                       b.name AS branch_name, b.address AS branch_address
+                FROM crm_chats cc
+                JOIN branches b ON b.id = cc.branch_id
+                WHERE cc.id=%s
+                """,
+                (chat_id,),
+            )
+            if not row:
+                abort(404)
+            for k in ("created_at", "updated_at"):
+                if row.get(k):
+                    row[k] = row[k].isoformat()
+        return _ok(row)
+
+    @app.patch(f"{API_BASE}/crm/chats/<int:chat_id>")
+    @require_auth
+    @require_crm_access
+    def crm_chats_update(chat_id: int) -> Response:
+        body = request.get_json(silent=True) or {}
+        display_name = (body.get("display_name") or "").strip() if body.get("display_name") is not None else None
+        with db_cursor() as (_, cur):
+            ok = fetch_one(cur, "SELECT id FROM crm_chats WHERE id=%s", (chat_id,))
+            if not ok:
+                abort(404)
+            if display_name is not None:
+                cur.execute("UPDATE crm_chats SET display_name=%s WHERE id=%s", (display_name or None, chat_id))
+            row = fetch_one(
+                cur,
+                "SELECT id, branch_id, telegram_chat_id, display_name, created_at, updated_at FROM crm_chats WHERE id=%s",
+                (chat_id,),
+            )
+        for k in ("created_at", "updated_at"):
+            if row.get(k):
+                row[k] = row[k].isoformat()
+        return _ok(row)
+
+    @app.delete(f"{API_BASE}/crm/chats/<int:chat_id>")
+    @require_auth
+    @require_crm_access
+    def crm_chats_delete(chat_id: int) -> Response:
+        with db_cursor() as (_, cur):
+            cur.execute("DELETE FROM crm_chats WHERE id=%s", (chat_id,))
+            if cur.rowcount == 0:
+                abort(404)
+        return _ok({"deleted": True})
+
+    @app.get(f"{API_BASE}/crm/chats/<int:chat_id>/messages")
+    @require_auth
+    @require_crm_access
+    def crm_chats_messages_list(chat_id: int) -> Response:
+        u = _current_user()
+        args = dict(request.args)
+        limit, offset = _paginate(args, default_limit=100, max_limit=500)
+        with db_cursor() as (_, cur):
+            ok = fetch_one(cur, "SELECT id FROM crm_chats WHERE id=%s", (chat_id,))
+            if not ok:
+                abort(404)
+            rows = fetch_all(
+                cur,
+                """
+                SELECT m.id, m.crm_chat_id, m.direction, m.content, m.telegram_message_id, m.sent_by_user_id,
+                       m.created_at, m.updated_at,
+                       u.login AS sent_by_login
+                FROM crm_messages m
+                LEFT JOIN auf_users u ON u.id = m.sent_by_user_id
+                WHERE m.crm_chat_id=%s
+                ORDER BY m.id DESC
+                LIMIT %s OFFSET %s
+                """,
+                (chat_id, limit, offset),
+            )
+            last_read = fetch_one(cur, "SELECT last_read_message_id FROM crm_chat_read_state WHERE user_id=%s AND crm_chat_id=%s", (u.id, chat_id))
+            last_read_id = int(last_read["last_read_message_id"]) if last_read and last_read.get("last_read_message_id") else 0
+            for r in rows:
+                for k in ("created_at", "updated_at"):
+                    if r.get(k):
+                        r[k] = r[k].isoformat()
+                r["read_by_me"] = int(r["id"]) <= last_read_id
+        return _ok({"items": rows, "last_read_message_id": last_read_id})
+
+    @app.post(f"{API_BASE}/crm/chats/<int:chat_id>/messages")
+    @require_auth
+    @require_crm_access
+    def crm_chats_messages_send(chat_id: int) -> Response:
+        u = _current_user()
+        body = request.get_json(silent=True) or {}
+        content = (body.get("content") or "").strip()
+        if not content:
+            abort(400, description="content is required")
+        with db_cursor() as (_, cur):
+            chat = fetch_one(cur, "SELECT id, telegram_chat_id FROM crm_chats WHERE id=%s", (chat_id,))
+            if not chat:
+                abort(404)
+            token = _get_telegram_token_from_settings()
+            if not token:
+                abort(503, description="Telegram bot token not configured")
+            sent = telegram_send_message(token, int(chat["telegram_chat_id"]), content)
+            mid = exec_one(
+                cur,
+                "INSERT INTO crm_messages (crm_chat_id, direction, content, telegram_message_id, sent_by_user_id) VALUES (%s,'out',%s,NULL,%s)",
+                (chat_id, content, u.id),
+            )
+            row = fetch_one(
+                cur,
+                """
+                SELECT m.id, m.crm_chat_id, m.direction, m.content, m.telegram_message_id, m.sent_by_user_id, m.created_at, m.updated_at
+                FROM crm_messages m WHERE m.id=%s
+                """,
+                (mid,),
+            )
+        for k in ("created_at", "updated_at"):
+            if row.get(k):
+                row[k] = row[k].isoformat()
+        row["sent_by_login"] = u.login
+        return _ok(row)
+
+    @app.get(f"{API_BASE}/crm/chats/<int:chat_id>/comments")
+    @require_auth
+    @require_crm_access
+    def crm_chats_comments_list(chat_id: int) -> Response:
+        with db_cursor() as (_, cur):
+            ok = fetch_one(cur, "SELECT id FROM crm_chats WHERE id=%s", (chat_id,))
+            if not ok:
+                abort(404)
+            rows = fetch_all(
+                cur,
+                """
+                SELECT c.id, c.crm_chat_id, c.user_id, c.comment_text, c.created_at,
+                       u.login AS user_login
+                FROM crm_chat_comments c
+                JOIN auf_users u ON u.id = c.user_id
+                WHERE c.crm_chat_id=%s
+                ORDER BY c.id
+                """,
+                (chat_id,),
+            )
+            for r in rows:
+                if r.get("created_at"):
+                    r["created_at"] = r["created_at"].isoformat()
+        return _ok({"items": rows})
+
+    @app.post(f"{API_BASE}/crm/chats/<int:chat_id>/comments")
+    @require_auth
+    @require_crm_access
+    def crm_chats_comments_create(chat_id: int) -> Response:
+        u = _current_user()
+        body = request.get_json(silent=True) or {}
+        comment_text = (body.get("comment_text") or "").strip()
+        if not comment_text:
+            abort(400, description="comment_text is required")
+        with db_cursor() as (_, cur):
+            ok = fetch_one(cur, "SELECT id FROM crm_chats WHERE id=%s", (chat_id,))
+            if not ok:
+                abort(404)
+            cid = exec_one(
+                cur,
+                "INSERT INTO crm_chat_comments (crm_chat_id, user_id, comment_text) VALUES (%s,%s,%s)",
+                (chat_id, u.id, comment_text),
+            )
+            row = fetch_one(cur, "SELECT id, crm_chat_id, user_id, comment_text, created_at FROM crm_chat_comments WHERE id=%s", (cid,))
+            if row.get("created_at"):
+                row["created_at"] = row["created_at"].isoformat()
+            row["user_login"] = u.login
+        return _ok(row)
+
+    @app.get(f"{API_BASE}/crm/notification-subscribers")
+    @require_auth
+    @require_crm_access
+    def crm_notification_subscribers_list() -> Response:
+        with db_cursor() as (_, cur):
+            rows = fetch_all(cur, "SELECT id, telegram_chat_id, label, created_at FROM crm_notification_subscribers ORDER BY id")
+            for r in rows:
+                if r.get("created_at"):
+                    r["created_at"] = r["created_at"].isoformat()
+        return _ok({"items": rows})
+
+    @app.post(f"{API_BASE}/crm/notification-subscribers")
+    @require_auth
+    @require_crm_access
+    def crm_notification_subscribers_add() -> Response:
+        body = request.get_json(silent=True) or {}
+        telegram_chat_id = body.get("telegram_chat_id")
+        label = (body.get("label") or "").strip() or None
+        if telegram_chat_id is None:
+            abort(400, description="telegram_chat_id is required")
+        try:
+            telegram_chat_id = int(telegram_chat_id)
+        except (TypeError, ValueError):
+            abort(400, description="telegram_chat_id must be integer")
+        with db_cursor() as (_, cur):
+            try:
+                nid = exec_one(
+                    cur,
+                    "INSERT INTO crm_notification_subscribers (telegram_chat_id, label) VALUES (%s,%s)",
+                    (telegram_chat_id, label),
+                )
+            except MySQLError as e:
+                if "Duplicate" in str(e):
+                    abort(400, description="This chat_id already subscribed")
+                raise
+            row = fetch_one(cur, "SELECT id, telegram_chat_id, label, created_at FROM crm_notification_subscribers WHERE id=%s", (nid,))
+            if row.get("created_at"):
+                row["created_at"] = row["created_at"].isoformat()
+        return _ok(row)
+
+    @app.delete(f"{API_BASE}/crm/notification-subscribers/<int:sub_id>")
+    @require_auth
+    @require_crm_access
+    def crm_notification_subscribers_remove(sub_id: int) -> Response:
+        with db_cursor() as (_, cur):
+            cur.execute("DELETE FROM crm_notification_subscribers WHERE id=%s", (sub_id,))
+            if cur.rowcount == 0:
+                abort(404)
+        return _ok({"deleted": True})
+
+    @app.get(f"{API_BASE}/crm/settings")
+    @require_auth
+    @require_crm_access
+    def crm_settings_get() -> Response:
+        with db_cursor() as (_, cur):
+            prod = fetch_one(cur, "SELECT value_text FROM settings WHERE `key`=%s", ("telegram_bot_token",))
+            dev = fetch_one(cur, "SELECT value_text FROM settings WHERE `key`=%s", ("telegram_bot_token_dev",))
+        return _ok({
+            "telegram_bot_configured": bool(prod and prod.get("value_text")),
+            "telegram_bot_dev_configured": bool(dev and dev.get("value_text")),
+        })
+
+    @app.put(f"{API_BASE}/crm/settings")
+    @require_auth
+    @require_crm_access
+    def crm_settings_put() -> Response:
+        body = request.get_json(silent=True) or {}
+        token_prod = (body.get("telegram_bot_token") or "").strip() or None
+        token_dev = (body.get("telegram_bot_token_dev") or "").strip() or None
+        with db_cursor() as (_, cur):
+            if "telegram_bot_token" in body:
+                cur.execute(
+                    "INSERT INTO settings (`key`, value_int, value_decimal, value_bool, value_text, description) VALUES (%s,NULL,NULL,NULL,%s,%s) ON DUPLICATE KEY UPDATE value_text=VALUES(value_text), description=VALUES(description)",
+                    ("telegram_bot_token", token_prod, "Токен Telegram-бота для CRM (PROD)"),
+                )
+            if "telegram_bot_token_dev" in body:
+                cur.execute(
+                    "INSERT INTO settings (`key`, value_int, value_decimal, value_bool, value_text, description) VALUES (%s,NULL,NULL,NULL,%s,%s) ON DUPLICATE KEY UPDATE value_text=VALUES(value_text), description=VALUES(description)",
+                    ("telegram_bot_token_dev", token_dev, "Токен Telegram-бота для CRM (DEV)"),
+                )
+        with db_cursor() as (_, cur):
+            prod = fetch_one(cur, "SELECT value_text FROM settings WHERE `key`=%s", ("telegram_bot_token",))
+            dev = fetch_one(cur, "SELECT value_text FROM settings WHERE `key`=%s", ("telegram_bot_token_dev",))
+        return _ok({
+            "telegram_bot_configured": bool(prod and prod.get("value_text")),
+            "telegram_bot_dev_configured": bool(dev and dev.get("value_text")),
+        })
+
+    # ------------------------------------------------------------
     # Minimal OpenAPI stub (для дальнейшей документации)
     # ------------------------------------------------------------
     @app.get(f"{API_BASE}/openapi.json")
@@ -3490,6 +4116,20 @@ def create_app() -> Flask:
 
 
 app = create_app()
+
+_telegram_bot_thread: threading.Thread | None = None
+
+
+def start_telegram_bot_thread() -> None:
+    global _telegram_bot_thread
+    if _telegram_bot_thread is not None and _telegram_bot_thread.is_alive():
+        return
+    _telegram_bot_thread = threading.Thread(target=_telegram_bot_poll_loop, daemon=True)
+    _telegram_bot_thread.start()
+
+
+# Запуск бота в фоне (один поток на процесс; при gunicorn с несколькими воркерами лучше бота вынести в отдельный процесс)
+start_telegram_bot_thread()
 
 
 if __name__ == "__main__":
