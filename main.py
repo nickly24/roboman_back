@@ -1231,6 +1231,7 @@ def create_app() -> Flask:
         body = request.get_json(silent=True) or {}
         fields: list[str] = []
         params: list[Any] = []
+        new_department_id_int: int | None = None
         for k in ["name", "address", "metro", "price_per_child", "is_active", "teacher_base_rate"]:
             if k in body:
                 fields.append(f"{k}=%s")
@@ -1240,6 +1241,17 @@ def create_app() -> Flask:
                     params.append(int(body.get(k)))
                 else:
                     params.append(body.get(k))
+
+        # Опциональная смена отдела филиала
+        if "department_id" in body:
+            dep_raw = body.get("department_id")
+            try:
+                new_department_id_int = int(dep_raw)
+            except Exception:
+                abort(400, description="Invalid department_id")
+            fields.append("department_id=%s")
+            params.append(new_department_id_int)
+
         if not fields:
             abort(400, description="No fields to update")
 
@@ -1256,6 +1268,17 @@ def create_app() -> Flask:
             )
             if not ok:
                 abort(404)
+
+            # Если отдел меняется — проверяем доступ владельца к целевому отделу
+            if new_department_id_int is not None:
+                ok_dep = fetch_one(
+                    cur,
+                    "SELECT 1 FROM department_owners WHERE department_id=%s AND owner_id=%s",
+                    (new_department_id_int, u.owner_id),
+                )
+                if not ok_dep:
+                    abort(403, description="No access to target department")
+
             cur.execute(f"UPDATE branches SET {', '.join(fields)} WHERE id=%s", tuple(params + [branch_id]))
             row = fetch_one(cur, "SELECT * FROM branches WHERE id=%s", (branch_id,))
         return _ok(row)
