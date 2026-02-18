@@ -3125,6 +3125,52 @@ def create_app() -> Flask:
             return _ok({"items": [{"id": u.teacher_id, "self": True}]})
         return teachers_list()
 
+    def _schedule_one(cur, schedule_id: int) -> dict[str, Any] | None:
+        """Fetch one schedule row with assigned_teacher and teachers list."""
+        row = fetch_one(
+            cur,
+            """
+            SELECT s.*, b.name AS branch_name, b.department_id, d.name AS department_name,
+                   t.id AS assigned_teacher_id, t.full_name AS assigned_teacher_name, t.color AS assigned_teacher_color
+            FROM schedules s
+            JOIN branches b ON b.id = s.branch_id
+            JOIN departments d ON d.id = b.department_id
+            LEFT JOIN teachers t ON t.id = s.teacher_id
+            WHERE s.id = %s
+            """,
+            (schedule_id,),
+        )
+        if not row:
+            return None
+        branch_id = int(row["branch_id"])
+        trows = fetch_all(
+            cur,
+            """
+            SELECT t.id, t.full_name, t.color, t.status
+            FROM branch_teachers bt
+            JOIN teachers t ON t.id = bt.teacher_id
+            WHERE bt.branch_id = %s AND t.status = 'working'
+            ORDER BY t.full_name
+            """,
+            (branch_id,),
+        )
+        row["teachers"] = [
+            {"id": tr["id"], "full_name": tr["full_name"], "color": tr["color"], "status": tr["status"]}
+            for tr in trows
+        ]
+        tid = row.get("assigned_teacher_id")
+        if tid is not None:
+            row["assigned_teacher"] = {
+                "id": int(tid),
+                "full_name": row.get("assigned_teacher_name"),
+                "color": row.get("assigned_teacher_color"),
+            }
+        else:
+            row["assigned_teacher"] = None
+        for k in ["assigned_teacher_id", "assigned_teacher_name", "assigned_teacher_color"]:
+            row.pop(k, None)
+        return row
+
     # ------------------------------------------------------------
     # Schedule (weekly plan)
     # ------------------------------------------------------------
@@ -3167,10 +3213,12 @@ def create_app() -> Flask:
             params.append(int(weekday))
 
         sql = f"""
-            SELECT s.*, b.name AS branch_name, b.department_id, d.name AS department_name
+            SELECT s.*, b.name AS branch_name, b.department_id, d.name AS department_name,
+                   t.id AS assigned_teacher_id, t.full_name AS assigned_teacher_name, t.color AS assigned_teacher_color
             FROM schedules s
             JOIN branches b ON b.id = s.branch_id
             JOIN departments d ON d.id = b.department_id
+            LEFT JOIN teachers t ON t.id = s.teacher_id
             WHERE {' AND '.join(where)}
             ORDER BY s.weekday, s.starts_at, s.id
         """
@@ -3208,6 +3256,17 @@ def create_app() -> Flask:
 
         for r in rows:
             r["teachers"] = teachers_by_branch.get(int(r["branch_id"]), [])
+            tid = r.get("assigned_teacher_id")
+            if tid is not None:
+                r["assigned_teacher"] = {
+                    "id": int(tid),
+                    "full_name": r.get("assigned_teacher_name"),
+                    "color": r.get("assigned_teacher_color"),
+                }
+            else:
+                r["assigned_teacher"] = None
+            for k in ["assigned_teacher_id", "assigned_teacher_name", "assigned_teacher_color"]:
+                r.pop(k, None)
         return _ok({"items": rows})
 
     @app.post(f"{API_BASE}/schedules")
@@ -3220,6 +3279,7 @@ def create_app() -> Flask:
         weekday = body.get("weekday")
         starts_at = body.get("starts_at")
         duration_minutes = body.get("duration_minutes")
+        teacher_id = body.get("teacher_id")
 
         if branch_id is None or weekday is None or starts_at is None or duration_minutes is None:
             abort(400, description="branch_id, weekday, starts_at, duration_minutes are required")
@@ -3244,25 +3304,27 @@ def create_app() -> Flask:
             if not ok:
                 abort(403, description="No access to branch")
 
+            if teacher_id is not None and teacher_id != "":
+                tid = int(teacher_id)
+                ok_t = fetch_one(
+                    cur,
+                    "SELECT 1 FROM branch_teachers WHERE branch_id=%s AND teacher_id=%s",
+                    (int(branch_id), tid),
+                )
+                if not ok_t:
+                    abort(400, description="Teacher must be assigned to this branch")
+            else:
+                tid = None
+
             sid = exec_one(
                 cur,
                 """
-                INSERT INTO schedules(branch_id, weekday, starts_at, duration_minutes)
-                VALUES (%s,%s,%s,%s)
+                INSERT INTO schedules(branch_id, weekday, starts_at, duration_minutes, teacher_id)
+                VALUES (%s,%s,%s,%s,%s)
                 """,
-                (int(branch_id), weekday_i, starts_at_s, duration_i),
+                (int(branch_id), weekday_i, starts_at_s, duration_i, tid),
             )
-            row = fetch_one(
-                cur,
-                """
-                SELECT s.*, b.name AS branch_name, b.department_id, d.name AS department_name
-                FROM schedules s
-                JOIN branches b ON b.id=s.branch_id
-                JOIN departments d ON d.id=b.department_id
-                WHERE s.id=%s
-                """,
-                (sid,),
-            )
+            row = _schedule_one(cur, sid)
         return _ok(row)
 
     @app.put(f"{API_BASE}/schedules/<int:schedule_id>")
@@ -3289,15 +3351,19 @@ def create_app() -> Flask:
         if "duration_minutes" in body:
             fields.append("duration_minutes=%s")
             params.append(_parse_int("duration_minutes", body.get("duration_minutes"), min_v=1, max_v=600))
+        if "teacher_id" in body:
+            fields.append("teacher_id=%s")
+            tid_val = body.get("teacher_id")
+            params.append(int(tid_val) if (tid_val is not None and tid_val != "") else None)
 
         if not fields:
             abort(400, description="No fields to update")
 
         with db_cursor() as (_, cur):
-            ok = fetch_one(
+            row_check = fetch_one(
                 cur,
                 """
-                SELECT 1
+                SELECT s.branch_id
                 FROM schedules s
                 JOIN branches b ON b.id=s.branch_id
                 JOIN department_owners do2 ON do2.department_id=b.department_id
@@ -3305,8 +3371,9 @@ def create_app() -> Flask:
                 """,
                 (schedule_id, u.owner_id),
             )
-            if not ok:
+            if not row_check:
                 abort(404)
+            current_branch_id = int(row_check["branch_id"])
 
             if "branch_id" in body:
                 ok2 = fetch_one(
@@ -3321,19 +3388,22 @@ def create_app() -> Flask:
                 )
                 if not ok2:
                     abort(403, description="No access to branch")
+                current_branch_id = int(body.get("branch_id"))
+
+            if "teacher_id" in body:
+                tid_val = body.get("teacher_id")
+                if tid_val is not None and tid_val != "":
+                    tid = int(tid_val)
+                    ok_t = fetch_one(
+                        cur,
+                        "SELECT 1 FROM branch_teachers WHERE branch_id=%s AND teacher_id=%s",
+                        (current_branch_id, tid),
+                    )
+                    if not ok_t:
+                        abort(400, description="Teacher must be assigned to this branch")
 
             cur.execute(f"UPDATE schedules SET {', '.join(fields)} WHERE id=%s", tuple(params + [schedule_id]))
-            row = fetch_one(
-                cur,
-                """
-                SELECT s.*, b.name AS branch_name, b.department_id, d.name AS department_name
-                FROM schedules s
-                JOIN branches b ON b.id=s.branch_id
-                JOIN departments d ON d.id=b.department_id
-                WHERE s.id=%s
-                """,
-                (schedule_id,),
-            )
+            row = _schedule_one(cur, schedule_id)
         return _ok(row)
 
     @app.delete(f"{API_BASE}/schedules/<int:schedule_id>")
