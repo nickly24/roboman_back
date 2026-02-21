@@ -192,6 +192,25 @@ def sheets_get(sheet_id: int) -> Response:
     })
 
 
+def _income_referral_amount(i: dict) -> float:
+    """Сумма рефералки в рублях для поступления."""
+    amt = _to_float(i["amount"])
+    rp = _to_float(i.get("referral_percent"))
+    if not rp or rp <= 0:
+        return 0.0
+    if i.get("referral_from_net"):
+        return (amt - _to_float(i["tax_amount"])) * (rp / 100)
+    return amt * (rp / 100)
+
+
+def _income_net_amount(i: dict) -> float:
+    """Чистая сумма поступления после вычета налога и рефералки."""
+    amt = _to_float(i["amount"])
+    tax = _to_float(i["tax_amount"])
+    ref = _income_referral_amount(i)
+    return amt - tax - ref
+
+
 def _compute_summary(
     incomes: list[dict],
     salaries: list[dict],
@@ -201,15 +220,7 @@ def _compute_summary(
 ) -> dict[str, Any]:
     total_revenue = sum(_to_float(i["amount"]) for i in incomes)
     total_tax = sum(_to_float(i["tax_amount"]) for i in incomes)
-    total_referral = 0.0
-    for i in incomes:
-        amt = _to_float(i["amount"])
-        rp = _to_float(i.get("referral_percent"))
-        if rp > 0:
-            if i.get("referral_from_net"):
-                total_referral += (amt - _to_float(i["tax_amount"])) * (rp / 100)
-            else:
-                total_referral += amt * (rp / 100)
+    total_referral = sum(_income_referral_amount(i) for i in incomes)
     total_costs = total_tax + total_referral
     total_salaries = sum(_to_float(s["amount"]) for s in salaries)
     total_expenses_other = sum(_to_float(e["amount"]) for e in expenses)
@@ -219,16 +230,19 @@ def _compute_summary(
     owner_balances: list[dict] = []
     for o in owners:
         oid = int(o["id"])
-        inc = sum(_to_float(i["amount"]) for i in incomes if int(i["owner_id"]) == oid)
+        owner_incomes = [i for i in incomes if int(i["owner_id"]) == oid]
+        inc_gross = sum(_to_float(i["amount"]) for i in owner_incomes)
+        inc_net = sum(_income_net_amount(i) for i in owner_incomes)
         sal = sum(_to_float(s["amount"]) for s in salaries if int(s["owner_id"]) == oid)
         exp = sum(_to_float(e["amount"]) for e in expenses if int(e["owner_id"]) == oid)
         out_tr = sum(_to_float(t["amount"]) for t in transfers if int(t["from_owner_id"]) == oid)
         in_tr = sum(_to_float(t["amount"]) for t in transfers if int(t["to_owner_id"]) == oid)
-        balance = inc - sal - exp - out_tr + in_tr
+        balance = inc_net - sal - exp - out_tr + in_tr
         owner_balances.append({
             "owner_id": oid,
             "owner_name": o["full_name"],
-            "income": inc,
+            "income": inc_gross,
+            "income_net": inc_net,
             "salary_paid": sal,
             "expenses_paid": exp,
             "transfers_out": out_tr,
@@ -301,18 +315,33 @@ def incomes_create(sheet_id: int) -> Response:
     branch_id = body.get("branch_id")
     owner_id = body.get("owner_id")
     amount = body.get("amount")
-    if branch_id is None or owner_id is None or amount is None:
-        abort(400, description="branch_id, owner_id, amount are required")
+    if branch_id is None or branch_id == "":
+        abort(400, description="Выберите филиал")
+    if owner_id is None or owner_id == "":
+        abort(400, description="Выберите владельца")
+    if amount is None or amount == "":
+        abort(400, description="Укажите сумму")
+    try:
+        amt_val = float(amount)
+    except (TypeError, ValueError):
+        abort(400, description="Сумма должна быть числом")
+    try:
+        branch_id_int = int(branch_id)
+        owner_id_int = int(owner_id)
+    except (TypeError, ValueError):
+        abort(400, description="Неверный формат филиала или владельца")
 
     with db_cursor() as (_, cur):
-        branch = fetch_one(cur, "SELECT id, department_id FROM branches WHERE id=%s", (int(branch_id),))
-        if not branch or int(branch["department_id"]) != int(sheet["department_id"]):
-            abort(400, description="Branch must belong to sheet's department")
-        owner = fetch_one(cur, "SELECT id FROM department_owners WHERE owner_id=%s AND department_id=%s", (int(owner_id), int(sheet["department_id"])))
+        branch = fetch_one(cur, "SELECT id, department_id FROM branches WHERE id=%s", (branch_id_int,))
+        if not branch:
+            abort(400, description="Филиал не найден")
+        if int(branch["department_id"]) != int(sheet["department_id"]):
+            abort(400, description="Филиал должен принадлежать отделу листа")
+        owner = fetch_one(cur, "SELECT owner_id FROM department_owners WHERE owner_id=%s AND department_id=%s", (owner_id_int, int(sheet["department_id"])))
         if not owner:
-            abort(400, description="Owner must belong to sheet's department")
+            abort(400, description="Владелец должен принадлежать отделу листа")
 
-        amt = float(amount)
+        amt = amt_val
         ref_pct = float(body.get("referral_percent") or 0) if body.get("referral_percent") is not None else None
         ref_from_net = 1 if (body.get("referral_from_net") or False) else 0
         ref_comment = (body.get("referral_comment") or "").strip() or None
@@ -321,7 +350,7 @@ def incomes_create(sheet_id: int) -> Response:
         income_id = exec_one(
             cur,
             "INSERT INTO accounting_incomes (sheet_id, branch_id, owner_id, amount, referral_percent, referral_from_net, referral_comment, tax_amount, created_by_user_id) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-            (sheet_id, int(branch_id), int(owner_id), amt, ref_pct, ref_from_net, ref_comment, tax, u.id),
+            (sheet_id, branch_id_int, owner_id_int, amt, ref_pct, ref_from_net, ref_comment, tax, u.id),
         )
         row = fetch_one(cur, "SELECT i.*, b.name AS branch_name, o.full_name AS owner_name FROM accounting_incomes i JOIN branches b ON b.id=i.branch_id JOIN owners o ON o.id=i.owner_id WHERE i.id=%s", (income_id,))
     return _ok(row)
@@ -408,20 +437,28 @@ def salaries_create(sheet_id: int) -> Response:
     teacher_id = body.get("teacher_id")
     amount = body.get("amount")
     period_type = body.get("period_type", "full")
-    if owner_id is None or teacher_id is None or amount is None:
-        abort(400, description="owner_id, teacher_id, amount are required")
+    if owner_id is None or owner_id == "":
+        abort(400, description="Выберите владельца")
+    if teacher_id is None or teacher_id == "":
+        abort(400, description="Выберите преподавателя")
+    if amount is None or amount == "":
+        abort(400, description="Укажите сумму")
+    try:
+        amt_val = float(amount)
+    except (TypeError, ValueError):
+        abort(400, description="Сумма должна быть числом")
     if period_type not in ("1_15", "16_end", "full"):
-        abort(400, description="period_type must be 1_15, 16_end, or full")
+        abort(400, description="Укажите период")
 
     with db_cursor() as (_, cur):
-        owner = fetch_one(cur, "SELECT id FROM department_owners WHERE owner_id=%s AND department_id=%s", (int(owner_id), int(sheet["department_id"])))
+        owner = fetch_one(cur, "SELECT owner_id FROM department_owners WHERE owner_id=%s AND department_id=%s", (int(owner_id), int(sheet["department_id"])))
         if not owner:
-            abort(400, description="Owner must belong to sheet's department")
-        teacher = fetch_one(cur, "SELECT id FROM teachers t JOIN branch_teachers bt ON bt.teacher_id=t.id JOIN branches b ON b.id=bt.branch_id WHERE t.id=%s AND b.department_id=%s", (int(teacher_id), int(sheet["department_id"])))
+            abort(400, description="Владелец должен принадлежать отделу листа")
+        teacher = fetch_one(cur, "SELECT t.id FROM teachers t JOIN branch_teachers bt ON bt.teacher_id=t.id JOIN branches b ON b.id=bt.branch_id WHERE t.id=%s AND b.department_id=%s", (int(teacher_id), int(sheet["department_id"])))
         if not teacher:
-            abort(400, description="Teacher must belong to sheet's department")
+            abort(400, description="Преподаватель должен быть привязан к филиалу отдела листа")
 
-        amt = float(amount)
+        amt = amt_val
         salary_id = exec_one(
             cur,
             "INSERT INTO accounting_salaries (sheet_id, owner_id, teacher_id, amount, period_type, created_by_user_id) VALUES (%s,%s,%s,%s,%s,%s)",
@@ -507,19 +544,25 @@ def expenses_create(sheet_id: int) -> Response:
 
     body = request.get_json(silent=True) or {}
     owner_id = body.get("owner_id")
-    name = body.get("name", "").strip()
+    name = (body.get("name") or "").strip()
     amount = body.get("amount")
-    if owner_id is None or amount is None:
-        abort(400, description="owner_id, amount are required")
+    if owner_id is None or owner_id == "":
+        abort(400, description="Выберите владельца")
     if not name:
-        abort(400, description="name is required")
+        abort(400, description="Укажите название расхода")
+    if amount is None or amount == "":
+        abort(400, description="Укажите сумму")
+    try:
+        amt_val = float(amount)
+    except (TypeError, ValueError):
+        abort(400, description="Сумма должна быть числом")
 
     with db_cursor() as (_, cur):
-        owner = fetch_one(cur, "SELECT id FROM department_owners WHERE owner_id=%s AND department_id=%s", (int(owner_id), int(sheet["department_id"])))
+        owner = fetch_one(cur, "SELECT owner_id FROM department_owners WHERE owner_id=%s AND department_id=%s", (int(owner_id), int(sheet["department_id"])))
         if not owner:
-            abort(400, description="Owner must belong to sheet's department")
+            abort(400, description="Владелец должен принадлежать отделу листа")
 
-        amt = float(amount)
+        amt = amt_val
         exp_id = exec_one(
             cur,
             "INSERT INTO accounting_expenses (sheet_id, owner_id, name, amount, created_by_user_id) VALUES (%s,%s,%s,%s,%s)",
@@ -607,22 +650,29 @@ def transfers_create(sheet_id: int) -> Response:
     from_owner_id = body.get("from_owner_id")
     to_owner_id = body.get("to_owner_id")
     amount = body.get("amount")
-    if from_owner_id is None or to_owner_id is None or amount is None:
-        abort(400, description="from_owner_id, to_owner_id, amount are required")
-
-    from_id = int(from_owner_id)
-    to_id = int(to_owner_id)
+    if from_owner_id is None or from_owner_id == "":
+        abort(400, description="Выберите владельца «От кого»")
+    if to_owner_id is None or to_owner_id == "":
+        abort(400, description="Выберите владельца «Кому»")
+    if amount is None or amount == "":
+        abort(400, description="Укажите сумму")
+    try:
+        from_id = int(from_owner_id)
+        to_id = int(to_owner_id)
+        amt_val = float(amount)
+    except (TypeError, ValueError):
+        abort(400, description="Неверный формат данных")
     if from_id == to_id:
-        abort(400, description="from_owner_id and to_owner_id must be different")
+        abort(400, description="Отправитель и получатель должны быть разными")
 
     dep_id = int(sheet["department_id"])
     with db_cursor() as (_, cur):
-        for oid, label in [(from_id, "from_owner_id"), (to_id, "to_owner_id")]:
-            owner = fetch_one(cur, "SELECT id FROM department_owners WHERE owner_id=%s AND department_id=%s", (oid, dep_id))
+        for oid, label in [(from_id, "От кого"), (to_id, "Кому")]:
+            owner = fetch_one(cur, "SELECT owner_id FROM department_owners WHERE owner_id=%s AND department_id=%s", (oid, dep_id))
             if not owner:
-                abort(400, description=f"{label} must belong to sheet's department")
+                abort(400, description=f"Владелец «{label}» должен принадлежать отделу листа")
 
-        amt = float(amount)
+        amt = amt_val
         if amt <= 0:
             abort(400, description="amount must be positive")
 
