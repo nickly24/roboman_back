@@ -19,7 +19,6 @@ import mysql.connector  # type: ignore
 from flask import Flask, Request, Response, abort, g, request, send_file
 from flask_cors import CORS
 from mysql.connector import Error as MySQLError  # type: ignore
-from mysql.connector import pooling  # type: ignore
 
 """
 Один гигантский файл backend/main.py (как просили):
@@ -54,91 +53,9 @@ TELEGRAM_BOT_ENV = "prod"
 
 
 # ------------------------------------------------------------
-# DB helpers (раньше было в db.py)
+# DB helpers — используем shared (единый пул для main и blueprints)
 # ------------------------------------------------------------
-
-
-@dataclass(frozen=True)
-class DbConfig:
-    host: str
-    user: str
-    password: str
-    database: str
-    port: int = 3306
-
-
-def load_db_config() -> DbConfig:
-    return DbConfig(
-        host=DB_HOST,
-        user=DB_USER,
-        password=DB_PASSWORD or "",
-        database=DB_NAME,
-        port=int(DB_PORT),
-    )
-
-
-_POOL: pooling.MySQLConnectionPool | None = None
-
-
-def get_pool() -> pooling.MySQLConnectionPool:
-    global _POOL
-    if _POOL is None:
-        cfg = load_db_config()
-        _POOL = pooling.MySQLConnectionPool(
-            pool_name="roboman_pool",
-            pool_size=int(DB_POOL_SIZE),
-            host=cfg.host,
-            user=cfg.user,
-            password=cfg.password,
-            database=cfg.database,
-            port=cfg.port,
-            autocommit=False,
-            pool_reset_session=True,
-        )
-    return _POOL
-
-
-@contextmanager
-def db_cursor(*, dictionary: bool = True) -> Iterator[tuple[Any, Any]]:
-    """
-    Context manager returning (conn, cur).
-    Commits on success, rollbacks on error.
-    """
-    pool = get_pool()
-    conn = pool.get_connection()
-    # Страхуемся от "MySQL Connection not available" на старом соединении
-    try:
-        if not conn.is_connected():
-            conn.reconnect(attempts=2, delay=0)
-    except Exception:
-        conn.reconnect(attempts=2, delay=0)
-    cur = conn.cursor(dictionary=dictionary, buffered=True)
-    try:
-        yield conn, cur
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        try:
-            cur.close()
-        finally:
-            conn.close()
-
-
-def fetch_one(cur: Any, sql: str, params: tuple[Any, ...] = ()) -> Any | None:
-    cur.execute(sql, params)
-    return cur.fetchone()
-
-
-def fetch_all(cur: Any, sql: str, params: tuple[Any, ...] = ()) -> list[Any]:
-    cur.execute(sql, params)
-    return list(cur.fetchall())
-
-
-def exec_one(cur: Any, sql: str, params: tuple[Any, ...] = ()) -> int:
-    cur.execute(sql, params)
-    return int(getattr(cur, "lastrowid", 0) or 0)
+from shared import db_cursor, exec_one, fetch_all, fetch_one
 
 
 # ------------------------------------------------------------
@@ -489,6 +406,12 @@ def create_app() -> Flask:
     @app.errorhandler(Exception)
     def _e500(e):  # type: ignore[no-untyped-def]
         return _err(str(e), status=500, code="INTERNAL_ERROR")
+
+    # ------------------------------------------------------------
+    # Blueprint: Бухгалтерия
+    # ------------------------------------------------------------
+    from blueprints.accounting import bp as accounting_bp
+    app.register_blueprint(accounting_bp, url_prefix=f"{API_BASE}/accounting")
 
     # ------------------------------------------------------------
     # Helpers for scoping
