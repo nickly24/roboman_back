@@ -31,6 +31,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Optional
+import argparse
 
 import fitz  # type: ignore  # PyMuPDF
 
@@ -39,22 +40,15 @@ sys.path.insert(0, str(__file__).rsplit("/backend/", 1)[0] + "/backend")
 from shared import db_cursor, exec_one, fetch_one  # type: ignore
 
 
-# Путь к папке с блоком «Ремённая передача»
-BLOCK_DIR = Path("/Users/nickly/Documents/сет нью/2 БЛОК. Ремённая передача")
-ABOUT_FILE = BLOCK_DIR / "about.txt"
-
-SECTION_NAME = "Ремённая передача"
-
-
 def log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def read_about_text() -> str:
-    if not ABOUT_FILE.exists():
-        log(f"[WARN] Файл описания не найден: {ABOUT_FILE}")
+def read_about_text(about_file: Path) -> str:
+    if not about_file.exists():
+        log(f"[WARN] Файл описания не найден: {about_file}")
         return ""
-    text = ABOUT_FILE.read_text(encoding="utf-8", errors="ignore").strip()
+    text = about_file.read_text(encoding="utf-8", errors="ignore").strip()
     return text
 
 
@@ -194,26 +188,65 @@ def upsert_instruction(
 
 
 def main() -> None:
-    if not BLOCK_DIR.exists():
-        log(f"[ERROR] Папка блока не найдена: {BLOCK_DIR}")
+    parser = argparse.ArgumentParser(
+        description="Импорт PDF-инструкций из папки блока в таблицу instructions"
+    )
+    parser.add_argument(
+        "--block-dir",
+        type=str,
+        default="/Users/nickly/Documents/сет нью/2 БЛОК. Ремённая передача",
+        help="Путь к папке с блоком (где лежат about.txt и PDF-файлы)",
+    )
+    parser.add_argument(
+        "--section-name",
+        type=str,
+        default=None,
+        help="Имя раздела в instruction_sections. "
+        "Если не указано — берём первую строку из about.txt, "
+        "а если её нет, то имя папки.",
+    )
+    args = parser.parse_args()
+
+    block_dir = Path(args.block_dir).expanduser()
+    about_file = block_dir / "about.txt"
+
+    if not block_dir.exists():
+        log(f"[ERROR] Папка блока не найдена: {block_dir}")
         sys.exit(1)
 
-    about_text = read_about_text()
-    section_id = ensure_section(SECTION_NAME, about_text)
+    about_text = read_about_text(about_file)
 
-    pdf_files = sorted(BLOCK_DIR.glob("*.pdf"))
+    # Определяем имя раздела
+    section_name: str
+    if args.section_name:
+        section_name = args.section_name
+    else:
+        first_line = (about_text.splitlines() or [""])[0].strip() if about_text else ""
+        if first_line:
+            section_name = first_line
+        else:
+            section_name = block_dir.name.strip()
+
+    log(f"[INFO] Папка блока: {block_dir}")
+    log(f"[INFO] Раздел: {section_name!r}")
+
+    section_id = ensure_section(section_name, about_text)
+
+    pdf_files = sorted(block_dir.glob("*.pdf"))
     if not pdf_files:
-        log(f"[WARN] В папке {BLOCK_DIR} не найдено PDF-файлов")
+        log(f"[WARN] В папке {block_dir} не найдено PDF-файлов")
         return
 
-    log(f"[INFO] Найдено {len(pdf_files)} PDF-файлов в {BLOCK_DIR}")
+    total_files = len(pdf_files)
+    log(f"[INFO] Найдено {total_files} PDF-файлов в {block_dir}")
 
     processed = 0
     errors = 0
 
-    for pdf_path in pdf_files:
+    for idx, pdf_path in enumerate(pdf_files, start=1):
         try:
-            log(f"[INFO] Обработка файла: {pdf_path.name}")
+            percent = int(idx * 100 / total_files)
+            log(f"[INFO] ({idx}/{total_files}, {percent}%) Обработка файла: {pdf_path.name}")
             name = make_instruction_name_from_filename(pdf_path)
             description = make_instruction_description(about_text, name)
 
@@ -238,7 +271,7 @@ def main() -> None:
             errors += 1
             log(f"[ERROR] Ошибка при обработке {pdf_path.name}: {e!r}")
 
-    log(f"[DONE] Обработано успешно: {processed}, с ошибками: {errors}")
+    log(f"[DONE] Обработано успешно: {processed}, с ошибками: {errors} (всего файлов: {total_files})")
 
 
 if __name__ == "__main__":

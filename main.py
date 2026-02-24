@@ -1696,10 +1696,22 @@ def create_app() -> Flask:
     @app.get(f"{API_BASE}/instructions")
     @require_auth
     def instructions_list() -> Response:
+        u = _current_user()
         args = dict(request.args)
         section_id = args.get("section_id")
         q = (args.get("q") or "").strip()
+        branch_id_arg = args.get("branch_id")
+        branch_ids_raw = args.get("branch_ids")  # строка вида "1,2,3"
+        built_arg = args.get("built")  # "1" = собиравшиеся, "0" = не собиравшиеся (по выбранным садам)
+        include_branches = _parse_bool(args.get("include_branches", True))
         limit, offset = _paginate(args, default_limit=100, max_limit=1000)
+
+        allowed_branch_ids: list[int] = []
+        if u.role == "OWNER" and u.owner_id:
+            allowed_branch_ids = _owner_branch_ids(u.owner_id)
+        elif u.role == "TEACHER" and u.teacher_id:
+            allowed_branch_ids = _teacher_branch_ids(u.teacher_id)
+
         where = ["1=1"]
         params: list[Any] = []
         if section_id:
@@ -1708,6 +1720,38 @@ def create_app() -> Flask:
         if q:
             where.append("i.name LIKE %s")
             params.append(f"%{q}%")
+
+        # Фильтрация по садам:
+        # - branch_id + built (старый вариант, один сад)
+        # - branch_ids + built (новый вариант, несколько садов, строка \"1,2,3\")
+        if built_arg in ("0", "1"):
+            branch_ids: list[int] = []
+            if branch_ids_raw:
+                try:
+                    branch_ids = [int(x) for x in str(branch_ids_raw).split(",") if x.strip()]
+                except ValueError:
+                    abort(400, description="branch_ids must be comma-separated integers")
+            elif branch_id_arg is not None:
+                try:
+                    branch_ids = [int(branch_id_arg)]
+                except (TypeError, ValueError):
+                    abort(400, description="branch_id must be integer")
+
+            if branch_ids:
+                if allowed_branch_ids:
+                    for bid in branch_ids:
+                        if bid not in allowed_branch_ids:
+                            abort(403, description="Branch not allowed")
+                placeholders = ",".join(["%s"] * len(branch_ids))
+                if built_arg == "1":
+                    where.append(
+                        f"EXISTS (SELECT 1 FROM lessons l WHERE l.instruction_id = i.id AND l.branch_id IN ({placeholders}))"
+                    )
+                else:
+                    where.append(
+                        f"NOT EXISTS (SELECT 1 FROM lessons l WHERE l.instruction_id = i.id AND l.branch_id IN ({placeholders}))"
+                    )
+                params.extend(branch_ids)
         where_sql = " AND ".join(where)
         params_with_pagination = params + [limit, offset]
 
@@ -1745,6 +1789,46 @@ def create_app() -> Flask:
                 """,
                 tuple(params_with_pagination),
             )
+
+            if include_branches and rows and allowed_branch_ids:
+                ids = [int(r["id"]) for r in rows]
+                placeholders = ",".join(["%s"] * len(ids))
+                branch_placeholders = ",".join(["%s"] * len(allowed_branch_ids))
+                built_rows = fetch_all(
+                    cur,
+                    f"""
+                    SELECT
+                        l.instruction_id,
+                        b.id AS branch_id,
+                        b.name AS branch_name,
+                        MAX(l.starts_at) AS last_at
+                    FROM lessons l
+                    JOIN branches b ON b.id = l.branch_id
+                    WHERE l.instruction_id IN ({placeholders})
+                      AND l.instruction_id IS NOT NULL
+                      AND b.id IN ({branch_placeholders})
+                    GROUP BY l.instruction_id, b.id, b.name
+                    """,
+                    tuple(ids + allowed_branch_ids),
+                )
+                by_iid: dict[int, list[dict[str, Any]]] = {}
+                for r in built_rows:
+                    iid = int(r["instruction_id"])
+                    if iid not in by_iid:
+                        by_iid[iid] = []
+                    by_iid[iid].append(
+                        {
+                            "branch_id": r["branch_id"],
+                            "branch_name": r["branch_name"],
+                            "last_at": r["last_at"].isoformat() if r.get("last_at") else None,
+                        }
+                    )
+                for r in rows:
+                    r["branches_built_at"] = by_iid.get(int(r["id"]), [])
+            elif rows:
+                for r in rows:
+                    r["branches_built_at"] = []
+
         return _ok({"items": rows, "limit": limit, "offset": offset, "total": total})
 
     @app.post(f"{API_BASE}/instructions")
@@ -1859,27 +1943,62 @@ def create_app() -> Flask:
     @app.get(f"{API_BASE}/instructions/<int:instruction_id>")
     @require_auth
     def instructions_get(instruction_id: int) -> Response:
+        u = _current_user()
+        allowed_branch_ids: list[int] = []
+        if u.role == "OWNER" and u.owner_id:
+            allowed_branch_ids = _owner_branch_ids(u.owner_id)
+        elif u.role == "TEACHER" and u.teacher_id:
+            allowed_branch_ids = _teacher_branch_ids(u.teacher_id)
+
         with db_cursor() as (_, cur):
             row = fetch_one(
                 cur,
                 """
                 SELECT
-                    id,
-                    section_id,
-                    name,
-                    description,
-                    pdf_filename,
-                    pdf_mime,
-                    created_at,
-                    updated_at,
-                    (photo_blob IS NOT NULL) AS has_photo
-                FROM instructions
-                WHERE id=%s
+                    i.id,
+                    i.section_id,
+                    s.name AS section_name,
+                    i.name,
+                    i.description,
+                    i.pdf_filename,
+                    i.pdf_mime,
+                    i.created_at,
+                    i.updated_at,
+                    (i.photo_blob IS NOT NULL) AS has_photo
+                FROM instructions i
+                JOIN instruction_sections s ON s.id = i.section_id
+                WHERE i.id=%s
                 """,
                 (instruction_id,),
             )
         if not row:
             abort(404)
+
+        if allowed_branch_ids:
+            with db_cursor() as (_, cur):
+                branch_placeholders = ",".join(["%s"] * len(allowed_branch_ids))
+                built_rows = fetch_all(
+                    cur,
+                    f"""
+                    SELECT b.id AS branch_id, b.name AS branch_name, MAX(l.starts_at) AS last_at
+                    FROM lessons l
+                    JOIN branches b ON b.id = l.branch_id
+                    WHERE l.instruction_id = %s AND b.id IN ({branch_placeholders})
+                    GROUP BY b.id, b.name
+                    """,
+                    (instruction_id,) + tuple(allowed_branch_ids),
+                )
+                row["branches_built_at"] = [
+                    {
+                        "branch_id": r["branch_id"],
+                        "branch_name": r["branch_name"],
+                        "last_at": r["last_at"].isoformat() if r.get("last_at") else None,
+                    }
+                    for r in built_rows
+                ]
+        else:
+            row["branches_built_at"] = []
+
         return _ok(row)
 
     @app.put(f"{API_BASE}/instructions/<int:instruction_id>")
@@ -3158,6 +3277,7 @@ def create_app() -> Flask:
                 where.append(scope_sql.replace("l.", "s."))
                 params.extend(scope_params)
         else:
+            # TEACHER: только слоты филиалов, к которым привязан преподаватель (branch_teachers)
             where.append(
                 """
                 EXISTS (

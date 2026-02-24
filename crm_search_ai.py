@@ -530,6 +530,68 @@ def register_routes(app: Flask, api_base: str) -> None:
                     r["converted_to_lead_at"] = r["converted_to_lead_at"].isoformat()
         return Response(json.dumps({"ok": True, "items": rows}, ensure_ascii=False), content_type="application/json; charset=utf-8")
 
+    @app.post(f"{api_base}/crm/leads/manual")
+    @_require_crm_access
+    def crm_lead_create_manual():
+        u = getattr(g, "current_user", None) or get_current_user()
+        body = request.get_json(silent=True) or {}
+        name = (body.get("name") or "").strip()
+        if not name:
+            abort(400, description="name is required")
+        address = (body.get("address") or "").strip()
+        phone = (body.get("phone") or "").strip()
+        website = (body.get("website") or "").strip()
+        notes = (body.get("notes") or "").strip()
+        lead_status_id = body.get("lead_status_id")
+
+        with db_cursor() as (_, cur):
+            if lead_status_id is not None:
+                try:
+                    lead_status_id = int(lead_status_id)
+                except (TypeError, ValueError):
+                    abort(400, description="lead_status_id must be integer")
+                st = fetch_one(cur, "SELECT id FROM crm_lead_statuses WHERE id=%s", (lead_status_id,))
+                if not st:
+                    abort(400, description="lead_status_id not found")
+            else:
+                default_status = fetch_one(
+                    cur,
+                    "SELECT id FROM crm_lead_statuses WHERE name='Взят в работу' AND is_system=1 LIMIT 1",
+                )
+                if not default_status:
+                    abort(500, description="Статус «Взят в работу» не найден в crm_lead_statuses")
+                lead_status_id = int(default_status["id"])
+
+            new_id = exec_one(
+                cur,
+                """INSERT INTO crm_prospect_kindergartens
+                   (name, address, phone, website, map_2gis_url, source, external_id, status, notes, lead_status_id, is_archived, converted_to_lead_at, created_by_user_id)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,0,CURRENT_TIMESTAMP,%s)""",
+                (
+                    name[:255],
+                    address[:512] or None,
+                    phone[:128] or None,
+                    website[:512] or None,
+                    None,
+                    "manual",
+                    None,
+                    None,
+                    notes[:2000] or None,
+                    lead_status_id,
+                    u.id,
+                ),
+            )
+            row = fetch_one(
+                cur,
+                """SELECT id, name, address, phone, website, map_2gis_url, notes, lead_status_id, converted_to_lead_at, branch_id
+                   FROM crm_prospect_kindergartens WHERE id=%s""",
+                (new_id,),
+            )
+            if row and row.get("converted_to_lead_at") and hasattr(row["converted_to_lead_at"], "isoformat"):
+                row["converted_to_lead_at"] = row["converted_to_lead_at"].isoformat()
+
+        return Response(json.dumps({"ok": True, "data": row}, ensure_ascii=False), content_type="application/json; charset=utf-8")
+
     @app.get(f"{api_base}/crm/leads/archive")
     @_require_crm_access
     def crm_leads_archive_list():
