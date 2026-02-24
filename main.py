@@ -1708,9 +1708,21 @@ def create_app() -> Flask:
         if q:
             where.append("i.name LIKE %s")
             params.append(f"%{q}%")
-        params.extend([limit, offset])
+        where_sql = " AND ".join(where)
+        params_with_pagination = params + [limit, offset]
 
         with db_cursor() as (_, cur):
+            total_row = fetch_one(
+                cur,
+                f"""
+                SELECT COUNT(*) AS total
+                FROM instructions i
+                JOIN instruction_sections s ON s.id=i.section_id
+                WHERE {where_sql}
+                """,
+                tuple(params),
+            )
+            total = int(total_row["total"]) if total_row else 0
             rows = fetch_all(
                 cur,
                 f"""
@@ -1727,13 +1739,13 @@ def create_app() -> Flask:
                     (i.photo_blob IS NOT NULL) AS has_photo
                 FROM instructions i
                 JOIN instruction_sections s ON s.id=i.section_id
-                WHERE {' AND '.join(where)}
+                WHERE {where_sql}
                 ORDER BY i.id DESC
                 LIMIT %s OFFSET %s
                 """,
-                tuple(params),
+                tuple(params_with_pagination),
             )
-        return _ok({"items": rows, "limit": limit, "offset": offset})
+        return _ok({"items": rows, "limit": limit, "offset": offset, "total": total})
 
     @app.post(f"{API_BASE}/instructions")
     @require_auth
