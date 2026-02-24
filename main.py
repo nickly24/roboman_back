@@ -4122,6 +4122,9 @@ def create_app() -> Flask:
     # CRM ИИ: summarize, ai-chat, transcribe-voice (из crm_ai.py)
     from crm_ai import register_routes as register_crm_ai_routes
     register_crm_ai_routes(app, API_BASE)
+    # CRM Поиск: ИИ-поиск детских садов (из crm_search_ai.py)
+    from crm_search_ai import register_routes as register_crm_search_ai_routes
+    register_crm_search_ai_routes(app, API_BASE)
     # Ничаты: объединённый ассистент (из crm_nchats.py)
     from crm_nchats import register_routes as register_crm_nchats_routes
     register_crm_nchats_routes(app, API_BASE)
