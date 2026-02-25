@@ -3278,16 +3278,12 @@ def create_app() -> Flask:
                 where.append(scope_sql.replace("l.", "s."))
                 params.extend(scope_params)
         else:
-            # TEACHER: только слоты филиалов, к которым привязан преподаватель (branch_teachers)
-            where.append(
-                """
-                EXISTS (
-                  SELECT 1 FROM branch_teachers bt
-                  WHERE bt.branch_id = s.branch_id AND bt.teacher_id = %s
-                )
-                """
-            )
+            # TEACHER: только слоты, к которым привязан этот преподаватель (schedules.teacher_id)
+            where.append("s.teacher_id=%s")
             params.append(u.teacher_id)
+            if department_id:
+                where.append("b.department_id=%s")
+                params.append(int(department_id))
 
         if branch_id:
             where.append("s.branch_id=%s")
