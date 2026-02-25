@@ -2485,7 +2485,8 @@ def create_app() -> Flask:
                 params.append(_parse_int("trial_children", body.get("trial_children"), min_v=0))
 
             if u.role == "OWNER":
-                for k in ["branch_id", "teacher_id", "is_creative", "instruction_id", "price_snapshot"]:
+                # branch_id нельзя менять при редактировании
+                for k in ["teacher_id", "is_creative", "instruction_id", "price_snapshot"]:
                     if k in body:
                         if k == "is_creative":
                             fields.append("is_creative=%s")

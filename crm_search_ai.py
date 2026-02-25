@@ -575,7 +575,7 @@ def register_routes(app: Flask, api_base: str) -> None:
                     None,
                     "manual",
                     None,
-                    None,
+                    "",  # status — NOT NULL в БД, пустая строка для ручного лида
                     notes[:2000] or None,
                     lead_status_id,
                     u.id,
