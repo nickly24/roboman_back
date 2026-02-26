@@ -529,7 +529,7 @@ def register_routes(app: Flask, api_base: str) -> None:
         final_content = ""
         for _ in range(max_rounds):
             payload = {
-                "model": "gpt-4o-mini",
+                "model": "deepseek-v3.2",
                 "messages": messages_for_api,
                 "tools": NCHATS_TOOLS,
                 "stream": False,

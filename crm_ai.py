@@ -45,7 +45,7 @@ def _postprocess_transcription(raw: str, api_key: str) -> str:
         r = requests.post(
             "https://api.aitunnel.ru/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-            json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": f"{prompt}\n\nТекст:\n{raw}"}], "max_tokens": 500},
+            json={"model": "deepseek-v3.2", "messages": [{"role": "user", "content": f"{prompt}\n\nТекст:\n{raw}"}], "max_tokens": 500},
             timeout=15,
         )
         r.raise_for_status()
@@ -394,7 +394,7 @@ def register_routes(app: Flask, api_base: str) -> None:
         try:
             r = requests.post(
                 "https://api.aitunnel.ru/v1/chat/completions",
-                json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}], "stream": True, "max_tokens": 500},
+                json={"model": "deepseek-v3.2", "messages": [{"role": "user", "content": prompt}], "stream": True, "max_tokens": 500},
                 headers=headers,
                 stream=True,
                 timeout=60,
@@ -496,7 +496,7 @@ def register_routes(app: Flask, api_base: str) -> None:
         max_rounds = 5
         final_content = ""
         for _ in range(max_rounds):
-            payload = {"model": "gpt-4o-mini", "messages": messages_for_api, "tools": TOOLS, "stream": False, "max_tokens": 2000}
+            payload = {"model": "deepseek-v3.2", "messages": messages_for_api, "tools": TOOLS, "stream": False, "max_tokens": 2000}
             try:
                 r = requests.post("https://api.aitunnel.ru/v1/chat/completions", json=payload, headers=headers, timeout=90)
                 r.raise_for_status()
