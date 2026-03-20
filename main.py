@@ -2206,6 +2206,7 @@ def create_app() -> Flask:
                   l.instruction_id,
                   i.name AS instruction_name,
                   l.is_salary_free,
+                  l.is_fixed_salary_2000,
                   l.price_snapshot,
                   l.revenue,
                   l.teacher_salary,
@@ -2237,6 +2238,7 @@ def create_app() -> Flask:
               l.instruction_id,
               i.name AS instruction_name,
               l.is_salary_free,
+              l.is_fixed_salary_2000,
               l.teacher_salary,
               l.created_by_user_id,
               l.created_at,
@@ -2343,6 +2345,7 @@ def create_app() -> Flask:
         is_creative = body.get("is_creative")
         instruction_id = body.get("instruction_id")
         is_salary_free: int | None = None
+        is_fixed_salary_2000_b = 1 if _parse_bool(body.get("is_fixed_salary_2000")) else 0
 
         if branch_id is None or starts_at is None or paid_children is None or trial_children is None or is_creative is None:
             abort(400, description="branch_id, starts_at, paid_children, trial_children, is_creative are required")
@@ -2410,9 +2413,9 @@ def create_app() -> Flask:
                 """
                 INSERT INTO lessons(
                   branch_id, teacher_id, starts_at, paid_children, trial_children,
-                  is_creative, instruction_id, is_salary_free, price_snapshot, created_by_user_id
+                  is_creative, instruction_id, is_salary_free, is_fixed_salary_2000, price_snapshot, created_by_user_id
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 (
                     int(branch_id),
@@ -2423,6 +2426,7 @@ def create_app() -> Flask:
                     is_creative_b,
                     int(instruction_id) if instruction_id is not None else None,
                     is_salary_free,
+                    is_fixed_salary_2000_b,
                     price_snapshot,
                     u.id,
                 ),
@@ -2444,7 +2448,7 @@ def create_app() -> Flask:
                 if int(row["teacher_id"]) != int(u.teacher_id or 0):
                     abort(403, description="Can edit only own lessons")
 
-                allowed = {"starts_at", "paid_children", "trial_children"}
+                allowed = {"starts_at", "paid_children", "trial_children", "is_fixed_salary_2000"}
                 forbidden = set(body.keys()) - allowed
                 if forbidden:
                     abort(403, description=f"Teacher cannot edit fields: {sorted(forbidden)}")
@@ -2483,6 +2487,10 @@ def create_app() -> Flask:
             if "trial_children" in body:
                 fields.append("trial_children=%s")
                 params.append(_parse_int("trial_children", body.get("trial_children"), min_v=0))
+
+            if "is_fixed_salary_2000" in body:
+                fields.append("is_fixed_salary_2000=%s")
+                params.append(1 if _parse_bool(body.get("is_fixed_salary_2000")) else 0)
 
             if u.role == "OWNER":
                 # branch_id нельзя менять при редактировании
