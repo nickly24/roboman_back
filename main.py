@@ -441,6 +441,9 @@ def create_app() -> Flask:
     from blueprints.accounting import bp as accounting_bp
     app.register_blueprint(accounting_bp, url_prefix=f"{API_BASE}/accounting")
 
+    from blueprints.curriculum import bp as curriculum_bp
+    app.register_blueprint(curriculum_bp, url_prefix=API_BASE)
+
     # ------------------------------------------------------------
     # Helpers for scoping
     # ------------------------------------------------------------
@@ -2205,6 +2208,14 @@ def create_app() -> Flask:
                   l.is_creative,
                   l.instruction_id,
                   i.name AS instruction_name,
+                  lr.curriculum_run_id,
+                  lr.curriculum_lesson_id,
+                  lr.curriculum_mode,
+                  cl.name AS curriculum_lesson_name,
+                  cm.id AS curriculum_module_id,
+                  cm.name AS curriculum_module_name,
+                  cp.id AS curriculum_plan_id,
+                  cp.name AS curriculum_plan_name,
                   l.is_salary_free,
                   l.is_fixed_salary_2000,
                   l.price_snapshot,
@@ -2218,6 +2229,10 @@ def create_app() -> Flask:
                 JOIN departments d ON d.id=b.department_id
                 JOIN teachers t ON t.id=l.teacher_id
                 LEFT JOIN instructions i ON i.id=l.instruction_id
+                JOIN lessons lr ON lr.id=l.id
+                LEFT JOIN curriculum_lessons cl ON cl.id=lr.curriculum_lesson_id
+                LEFT JOIN curriculum_modules cm ON cm.id=cl.module_id
+                LEFT JOIN curriculum_plans cp ON cp.id=cm.plan_id
             """
         return """
             SELECT
@@ -2237,6 +2252,14 @@ def create_app() -> Flask:
               l.is_creative,
               l.instruction_id,
               i.name AS instruction_name,
+              lr.curriculum_run_id,
+              lr.curriculum_lesson_id,
+              lr.curriculum_mode,
+              cl.name AS curriculum_lesson_name,
+              cm.id AS curriculum_module_id,
+              cm.name AS curriculum_module_name,
+              cp.id AS curriculum_plan_id,
+              cp.name AS curriculum_plan_name,
               l.is_salary_free,
               l.is_fixed_salary_2000,
               l.teacher_salary,
@@ -2248,6 +2271,10 @@ def create_app() -> Flask:
             JOIN departments d ON d.id=b.department_id
             JOIN teachers t ON t.id=l.teacher_id
             LEFT JOIN instructions i ON i.id=l.instruction_id
+            JOIN lessons lr ON lr.id=l.id
+            LEFT JOIN curriculum_lessons cl ON cl.id=lr.curriculum_lesson_id
+            LEFT JOIN curriculum_modules cm ON cm.id=cl.module_id
+            LEFT JOIN curriculum_plans cp ON cp.id=cm.plan_id
         """
 
     @app.get(f"{API_BASE}/lessons")
@@ -2344,11 +2371,13 @@ def create_app() -> Flask:
         trial_children = body.get("trial_children")
         is_creative = body.get("is_creative")
         instruction_id = body.get("instruction_id")
+        curriculum_mode = body.get("curriculum_mode")
+        curriculum_lesson_id = body.get("curriculum_lesson_id")
         is_salary_free: int | None = None
         is_fixed_salary_2000_b = 1 if _parse_bool(body.get("is_fixed_salary_2000")) else 0
 
-        if branch_id is None or starts_at is None or paid_children is None or trial_children is None or is_creative is None:
-            abort(400, description="branch_id, starts_at, paid_children, trial_children, is_creative are required")
+        if branch_id is None or starts_at is None or paid_children is None or trial_children is None:
+            abort(400, description="branch_id, starts_at, paid_children and trial_children are required")
 
         # teacher_id: TEACHER всегда сам, OWNER может передать
         teacher_id = body.get("teacher_id")
@@ -2357,13 +2386,6 @@ def create_app() -> Flask:
         else:
             if teacher_id is None:
                 abort(400, description="teacher_id is required for OWNER create")
-
-        # валидация типа занятия
-        is_creative_b = 1 if _parse_bool(is_creative) else 0
-        if is_creative_b == 1 and instruction_id is not None:
-            abort(400, description="Creative lesson cannot have instruction_id")
-        if is_creative_b == 0 and instruction_id is None:
-            abort(400, description="Non-creative lesson must have instruction_id")
 
         paid_i = _parse_int("paid_children", paid_children, min_v=0)
         trial_i = _parse_int("trial_children", trial_children, min_v=0)
@@ -2399,6 +2421,27 @@ def create_app() -> Flask:
                 if not ok:
                     abort(403, description="Teacher is not assigned to this branch")
 
+            from blueprints.curriculum import validate_lesson_curriculum
+
+            curriculum = validate_lesson_curriculum(
+                cur,
+                int(branch_id),
+                str(curriculum_mode) if curriculum_mode not in (None, "") else None,
+                curriculum_lesson_id,
+                instruction_id,
+            )
+            instruction_id = curriculum["instruction_id"]
+            if curriculum["run_id"] is None:
+                if is_creative is None:
+                    abort(400, description="is_creative is required for a branch without curriculum")
+                is_creative_b = 1 if _parse_bool(is_creative) else 0
+                if is_creative_b == 1 and instruction_id is not None:
+                    abort(400, description="Creative lesson cannot have instruction_id")
+                if is_creative_b == 0 and instruction_id is None:
+                    abort(400, description="Non-creative lesson must have instruction_id")
+            else:
+                is_creative_b = 0 if instruction_id is not None else 1
+
             br = fetch_one(cur, "SELECT price_per_child FROM branches WHERE id=%s", (int(branch_id),))
             if not br:
                 abort(400, description="Unknown branch")
@@ -2413,9 +2456,10 @@ def create_app() -> Flask:
                 """
                 INSERT INTO lessons(
                   branch_id, teacher_id, starts_at, paid_children, trial_children,
-                  is_creative, instruction_id, is_salary_free, is_fixed_salary_2000, price_snapshot, created_by_user_id
+                  is_creative, instruction_id, curriculum_run_id, curriculum_lesson_id, curriculum_mode,
+                  is_salary_free, is_fixed_salary_2000, price_snapshot, created_by_user_id
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 (
                     int(branch_id),
@@ -2425,6 +2469,9 @@ def create_app() -> Flask:
                     trial_i,
                     is_creative_b,
                     int(instruction_id) if instruction_id is not None else None,
+                    curriculum["run_id"],
+                    curriculum["lesson_id"],
+                    curriculum["mode"],
                     is_salary_free,
                     is_fixed_salary_2000_b,
                     price_snapshot,
@@ -2496,6 +2543,8 @@ def create_app() -> Flask:
                 # branch_id нельзя менять при редактировании
                 for k in ["teacher_id", "is_creative", "instruction_id", "price_snapshot"]:
                     if k in body:
+                        if row.get("curriculum_run_id") is not None and k in {"is_creative", "instruction_id"}:
+                            abort(409, description="Curriculum lesson type and instruction cannot be changed")
                         if k == "is_creative":
                             fields.append("is_creative=%s")
                             params.append(1 if _parse_bool(body.get(k)) else 0)
@@ -2668,6 +2717,10 @@ def create_app() -> Flask:
                 "total_children",
                 "is_creative",
                 "instruction_name",
+                "curriculum_mode",
+                "curriculum_plan_name",
+                "curriculum_module_name",
+                "curriculum_lesson_name",
                 "price_snapshot",
                 "revenue",
                 "teacher_salary",
@@ -2684,6 +2737,10 @@ def create_app() -> Flask:
                 "total_children",
                 "is_creative",
                 "instruction_name",
+                "curriculum_mode",
+                "curriculum_plan_name",
+                "curriculum_module_name",
+                "curriculum_lesson_name",
                 "teacher_salary",
             ]
         w = csv.DictWriter(buf, fieldnames=cols)
@@ -4450,12 +4507,13 @@ def start_telegram_bot_thread() -> None:
     _telegram_bot_thread.start()
 
 
-# Запуск бота в фоне (один поток на процесс; при gunicorn с несколькими воркерами лучше бота вынести в отдельный процесс)
-start_telegram_bot_thread()
+# Запуск бота в фоне (один поток на процесс; при gunicorn с несколькими воркерами лучше бота вынести в отдельный процесс).
+# Флаг нужен для тестов и служебных команд, чтобы импорт приложения не запускал long polling.
+if not _parse_bool(os.environ.get("DISABLE_TELEGRAM_BOT")):
+    start_telegram_bot_thread()
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "80"))
     debug = _parse_bool(os.environ.get("FLASK_DEBUG"))
     app.run(host="0.0.0.0", port=port, debug=debug)
-
