@@ -13,6 +13,7 @@ import mysql.connector  # type: ignore
 from flask import Flask, Request, Response, abort, g, request, send_file
 from flask_cors import CORS
 from mysql.connector import Error as MySQLError  # type: ignore
+from lesson_time import parse_lesson_time
 
 """
 Один гигантский файл backend/main.py (как просили):
@@ -2233,9 +2234,9 @@ def create_app() -> Flask:
             abort(400, description="paid_children + trial_children must be > 0")
 
         try:
-            starts_dt = datetime.fromisoformat(str(starts_at))
-        except Exception:
-            abort(400, description="starts_at must be ISO datetime")
+            starts_dt = parse_lesson_time(starts_at)
+        except ValueError as error:
+            abort(400, description=str(error))
 
         with db_cursor() as (_, cur):
             # scope checks
@@ -2361,9 +2362,9 @@ def create_app() -> Flask:
 
             if "starts_at" in body:
                 try:
-                    dt = datetime.fromisoformat(str(body.get("starts_at")))
-                except Exception:
-                    abort(400, description="starts_at must be ISO datetime")
+                    dt = parse_lesson_time(body.get("starts_at"))
+                except ValueError as error:
+                    abort(400, description=str(error))
                 fields.append("starts_at=%s")
                 params.append(dt.strftime("%Y-%m-%d %H:%M:%S"))
 
