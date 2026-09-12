@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from pathlib import Path
 
 import mysql.connector  # type: ignore
@@ -13,31 +14,62 @@ MIGRATIONS_DIR = ROOT / "migrations"
 
 
 def _statements(sql: str) -> list[str]:
+    """Split SQL including DELIMITER trigger bodies, quoted text and comments."""
     statements: list[str] = []
     current: list[str] = []
-    in_single = False
-    in_double = False
-    escaped = False
-    for char in sql:
-        if escaped:
+    delimiter = ';'
+    quote = None
+    comment = None
+    index = 0
+    while index < len(sql):
+        char = sql[index]
+        following = sql[index:index + 2]
+        if comment:
             current.append(char)
-            escaped = False
+            if comment == 'line' and char == '\n':
+                comment = None
+            elif comment == 'block' and following == '*/':
+                current.append('/')
+                index += 1
+                comment = None
+            index += 1
             continue
-        if char == "\\" and (in_single or in_double):
+        if quote:
             current.append(char)
-            escaped = True
+            if char == '\\' and index + 1 < len(sql):
+                current.append(sql[index + 1])
+                index += 1
+            elif char == quote:
+                if index + 1 < len(sql) and sql[index + 1] == quote:
+                    current.append(quote)
+                    index += 1
+                else:
+                    quote = None
+            index += 1
             continue
-        if char == "'" and not in_double:
-            in_single = not in_single
-        elif char == '"' and not in_single:
-            in_double = not in_double
-        if char == ";" and not in_single and not in_double:
+        if index == 0 or sql[index - 1] == '\n':
+            directive = re.match(r'[ \t]*DELIMITER[ \t]+(\S+)[ \t]*(?:\r?\n|$)', sql[index:], re.IGNORECASE)
+            if directive:
+                delimiter = directive.group(1)
+                index += directive.end()
+                continue
+        if char in ("'", '"', '`'):
+            quote = char
+        elif char == '#' or (following == '--' and (index + 2 == len(sql) or sql[index + 2].isspace())):
+            comment = 'line'
+        elif following == '/*':
+            comment = 'block'
+        if not quote and not comment and sql.startswith(delimiter, index):
             statement = "".join(current).strip()
             if statement:
                 statements.append(statement)
             current = []
+            index += len(delimiter)
         else:
             current.append(char)
+            index += 1
+    if quote or comment == 'block':
+        raise ValueError('Unterminated SQL quote or block comment')
     trailing = "".join(current).strip()
     if trailing:
         statements.append(trailing)

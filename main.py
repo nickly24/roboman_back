@@ -18,7 +18,7 @@ from mysql.connector import Error as MySQLError  # type: ignore
 Один гигантский файл backend/main.py (как просили):
 - конфиг БД
 - пул/курсоры
-- auth (Bearer user_id без безопасности)
+- auth (opaque bearer sessions)
 - все роуты
 - внизу app.run
 """
@@ -52,65 +52,8 @@ from shared import db_cursor, exec_one, fetch_all, fetch_one
 # Auth helpers (раньше было в auth.py)
 # ------------------------------------------------------------
 
-Role = Literal["OWNER", "TEACHER"]
-
-
-@dataclass(frozen=True)
-class CurrentUser:
-    id: int
-    role: Role
-    owner_id: int | None
-    teacher_id: int | None
-    login: str
-
-
-def _extract_token(req: Request) -> str | None:
-    # Простая схема без безопасности:
-    # Authorization: Bearer <user_id>
-    auth = req.headers.get("Authorization", "").strip()
-    if not auth:
-        return None
-    parts = auth.split()
-    if len(parts) == 2 and parts[0].lower() == "bearer":
-        return parts[1]
-    return None
-
-
-def get_current_user() -> CurrentUser:
-    tok = _extract_token(request)
-    if not tok:
-        abort(401, description="Missing Authorization Bearer token")
-    try:
-        user_id = int(tok)
-    except ValueError:
-        abort(401, description="Invalid token format")
-
-    with db_cursor() as (_, cur):
-        row = fetch_one(
-            cur,
-            """
-            SELECT id, login, role, owner_id, teacher_id, is_active
-            FROM auf_users
-            WHERE id=%s
-            """,
-            (user_id,),
-        )
-        if not row:
-            abort(401, description="Unknown user")
-        if int(row["is_active"]) != 1:
-            abort(403, description="User is inactive")
-
-        role = row["role"]
-        if role not in ("OWNER", "TEACHER"):
-            abort(403, description="Invalid user role")
-
-        return CurrentUser(
-            id=int(row["id"]),
-            login=str(row["login"]),
-            role=role,  # type: ignore[arg-type]
-            owner_id=int(row["owner_id"]) if row["owner_id"] is not None else None,
-            teacher_id=int(row["teacher_id"]) if row["teacher_id"] is not None else None,
-        )
+from shared import (Role, CurrentUser, get_current_user, enforce_branch_route,
+                    password_matches, hash_password, create_session, revoke_session)
 
 
 F = TypeVar("F", bound=Callable[..., Any])
@@ -120,6 +63,7 @@ def require_auth(fn: F) -> F:
     @wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         g.current_user = get_current_user()
+        enforce_branch_route(g.current_user)
         return fn(*args, **kwargs)
 
     return wrapper  # type: ignore[return-value]
@@ -304,6 +248,10 @@ def create_app() -> Flask:
     from blueprints.accounting import bp as accounting_bp
     app.register_blueprint(accounting_bp, url_prefix=f"{API_BASE}/accounting")
 
+    from blueprints.branch_portal import portal_bp, invoices_bp
+    app.register_blueprint(portal_bp, url_prefix=f"{API_BASE}/portal")
+    app.register_blueprint(invoices_bp, url_prefix=f"{API_BASE}/accounting")
+
     from blueprints.calendar import bp as calendar_bp
     app.register_blueprint(calendar_bp, url_prefix=f"{API_BASE}/calendar")
 
@@ -383,7 +331,7 @@ def create_app() -> Flask:
         return _ok(routes)
 
     # ------------------------------------------------------------
-    # Auth (без безопасности: token == user_id)
+    # Auth: проверка пароля и отзываемые серверные сессии
     # ------------------------------------------------------------
     @app.post(f"{API_BASE}/auth/login")
     def auth_login() -> Response:
@@ -396,15 +344,16 @@ def create_app() -> Flask:
         with db_cursor() as (_, cur):
             user = fetch_one(
                 cur,
-                "SELECT id, login, password_hash, role, owner_id, teacher_id, is_active, crm_access FROM auf_users WHERE login=%s",
+                "SELECT id, login, password_hash, role, owner_id, teacher_id, branch_id, is_active, crm_access FROM auf_users WHERE login=%s",
                 (login,),
             )
             if not user:
                 abort(401, description="Invalid login/password")
             if int(user["is_active"]) != 1:
                 abort(403, description="User is inactive")
-            # По требованиям проекта: без безопасности.
-            # Пароль в БД может быть "хэш-плейсхолдером" (см. seed_db.py), поэтому пароль НЕ валидируем.
+            if not isinstance(password, str) or not password_matches(str(user['password_hash']), password):
+                abort(401, description="Неверный логин или пароль")
+            user.pop('password_hash', None)
 
             role = user["role"]
             profile: dict[str, Any] | None = None
@@ -413,13 +362,22 @@ def create_app() -> Flask:
             elif role == "TEACHER":
                 profile = fetch_one(cur, "SELECT * FROM teachers WHERE id=%s", (user["teacher_id"],)) or None
 
-        token = str(int(user["id"]))
+            elif role == "BRANCH":
+                if user.get('owner_id') is not None or user.get('teacher_id') is not None:
+                    abort(403, description="Некорректная привязка кабинета сада")
+                profile = fetch_one(cur, "SELECT id,name,address,is_active FROM branches WHERE id=%s", (user['branch_id'],))
+                if not profile or not profile['is_active']:
+                    abort(403, description="Кабинет сада отключён")
+            else:
+                abort(403, description="Неизвестная роль")
+            token = create_session(cur, int(user['id']))
         return _ok({"token": token, "role": role, "user": user, "profile": profile})
 
     @app.post(f"{API_BASE}/auth/logout")
     @require_auth
     def auth_logout() -> Response:
-        # Нечего делать: токен не хранится
+        with db_cursor() as (_, cur):
+            revoke_session(cur)
         return _ok({"logged_out": True})
 
     @app.get(f"{API_BASE}/auth/me")
@@ -429,7 +387,7 @@ def create_app() -> Flask:
         with db_cursor() as (_, cur):
             user = fetch_one(
                 cur,
-                "SELECT id, login, role, owner_id, teacher_id, is_active, crm_access, created_at, updated_at FROM auf_users WHERE id=%s",
+                "SELECT id, login, role, owner_id, teacher_id, branch_id, is_active, crm_access, created_at, updated_at FROM auf_users WHERE id=%s",
                 (u.id,),
             )
             profile = None
@@ -437,6 +395,8 @@ def create_app() -> Flask:
                 profile = fetch_one(cur, "SELECT * FROM owners WHERE id=%s", (u.owner_id,))
             if u.role == "TEACHER" and u.teacher_id:
                 profile = fetch_one(cur, "SELECT * FROM teachers WHERE id=%s", (u.teacher_id,))
+            if u.role == "BRANCH" and u.branch_id:
+                profile = fetch_one(cur, "SELECT id,name,address,is_active FROM branches WHERE id=%s", (u.branch_id,))
         return _ok({"user": user, "profile": profile})
 
     # ------------------------------------------------------------
@@ -461,7 +421,7 @@ def create_app() -> Flask:
         q = (args.get("q") or "").strip()
         limit, offset = _paginate(args)
 
-        where: list[str] = ["1=1"]
+        where: list[str] = ["role <> 'BRANCH'"]
         params: list[Any] = []
         if role:
             where.append("role=%s")
@@ -474,7 +434,7 @@ def create_app() -> Flask:
             params.append(f"%{q}%")
 
         sql = f"""
-            SELECT id, login, role, owner_id, teacher_id, is_active, crm_access, created_at, updated_at
+            SELECT id, login, role, owner_id, teacher_id, branch_id, is_active, crm_access, created_at, updated_at
             FROM auf_users
             WHERE {' AND '.join(where)}
             ORDER BY id DESC
@@ -514,7 +474,7 @@ def create_app() -> Flask:
                 INSERT INTO auf_users(login, password_hash, role, owner_id, teacher_id, is_active)
                 VALUES (%s,%s,%s,%s,%s,%s)
                 """,
-                (login, str(password), role, owner_id, teacher_id, is_active),
+                (login, hash_password(password), role, owner_id, teacher_id, is_active),
             )
             row = fetch_one(
                 cur,
@@ -523,14 +483,21 @@ def create_app() -> Flask:
             )
         return _ok(row)
 
+    def _reject_generic_branch_user(user_id: int) -> None:
+        with db_cursor() as (_, cur):
+            target = fetch_one(cur, "SELECT role FROM auf_users WHERE id=%s", (user_id,))
+        if target and target['role'] == 'BRANCH':
+            abort(403, description="Кабинеты садов изменяются через раздел доступа филиалов")
+
     @app.get(f"{API_BASE}/users/<int:user_id>")
     @require_auth
     @require_role("OWNER")
     def users_get(user_id: int) -> Response:
+        _reject_generic_branch_user(user_id)
         with db_cursor() as (_, cur):
             row = fetch_one(
                 cur,
-                "SELECT id, login, role, owner_id, teacher_id, is_active, crm_access, created_at, updated_at FROM auf_users WHERE id=%s",
+                "SELECT id, login, role, owner_id, teacher_id, branch_id, is_active, crm_access, created_at, updated_at FROM auf_users WHERE id=%s",
                 (user_id,),
             )
         if not row:
@@ -541,6 +508,7 @@ def create_app() -> Flask:
     @require_auth
     @require_role("OWNER")
     def users_update(user_id: int) -> Response:
+        _reject_generic_branch_user(user_id)
         body = request.get_json(silent=True) or {}
         fields: list[str] = []
         params: list[Any] = []
@@ -549,7 +517,7 @@ def create_app() -> Flask:
             params.append((body.get("login") or "").strip())
         if "password" in body:
             fields.append("password_hash=%s")
-            params.append(str(body.get("password")))
+            params.append(hash_password(body.get("password")))
         if "is_active" in body:
             fields.append("is_active=%s")
             params.append(1 if _parse_bool(body.get("is_active")) else 0)
@@ -566,9 +534,11 @@ def create_app() -> Flask:
         params.append(user_id)
         with db_cursor() as (_, cur):
             cur.execute(f"UPDATE auf_users SET {', '.join(fields)} WHERE id=%s", tuple(params))
+            if "password" in body or ("is_active" in body and not _parse_bool(body['is_active'])):
+                cur.execute("DELETE FROM auth_sessions WHERE user_id=%s", (user_id,))
             row = fetch_one(
                 cur,
-                "SELECT id, login, role, owner_id, teacher_id, is_active, crm_access, created_at, updated_at FROM auf_users WHERE id=%s",
+                "SELECT id, login, role, owner_id, teacher_id, branch_id, is_active, crm_access, created_at, updated_at FROM auf_users WHERE id=%s",
                 (user_id,),
             )
         if not row:
@@ -579,6 +549,7 @@ def create_app() -> Flask:
     @require_auth
     @require_role("OWNER")
     def users_activate(user_id: int) -> Response:
+        _reject_generic_branch_user(user_id)
         with db_cursor() as (_, cur):
             cur.execute("UPDATE auf_users SET is_active=1 WHERE id=%s", (user_id,))
         return users_get(user_id)
@@ -587,14 +558,17 @@ def create_app() -> Flask:
     @require_auth
     @require_role("OWNER")
     def users_deactivate(user_id: int) -> Response:
+        _reject_generic_branch_user(user_id)
         with db_cursor() as (_, cur):
             cur.execute("UPDATE auf_users SET is_active=0 WHERE id=%s", (user_id,))
+            cur.execute("DELETE FROM auth_sessions WHERE user_id=%s", (user_id,))
         return users_get(user_id)
 
     @app.delete(f"{API_BASE}/users/<int:user_id>")
     @require_auth
     @require_role("OWNER")
     def users_delete(user_id: int) -> Response:
+        _reject_generic_branch_user(user_id)
         with db_cursor() as (_, cur):
             cur.execute("DELETE FROM auf_users WHERE id=%s", (user_id,))
         return _ok({"deleted": True})
@@ -629,7 +603,7 @@ def create_app() -> Flask:
                 t.is_salary_free,
                 u.id AS user_id,
                 u.login,
-                u.password_hash AS password,
+                NULL AS password,
                 u.is_active,
                 u.created_at AS user_created_at,
                 u.updated_at AS user_updated_at
@@ -675,7 +649,7 @@ def create_app() -> Flask:
                 INSERT INTO auf_users(login, password_hash, role, teacher_id, is_active)
                 VALUES (%s,%s,'TEACHER',%s,%s)
                 """,
-                (login, str(password), teacher_id, is_active),
+                (login, hash_password(password), teacher_id, is_active),
             )
 
             row = fetch_one(
@@ -689,7 +663,7 @@ def create_app() -> Flask:
                     t.is_salary_free,
                     u.id AS user_id,
                     u.login,
-                    u.password_hash AS password,
+                    NULL AS password,
                     u.is_active,
                     u.created_at AS user_created_at,
                     u.updated_at AS user_updated_at
@@ -1382,7 +1356,7 @@ def create_app() -> Flask:
                 exec_one(
                     cur,
                     "INSERT INTO auf_users(login, password_hash, role, teacher_id, is_active) VALUES (%s,%s,'TEACHER',%s,1)",
-                    (login, str(password), tid),
+                    (login, hash_password(password), tid),
                 )
             row = fetch_one(cur, "SELECT * FROM teachers WHERE id=%s", (tid,))
         return _ok(row)

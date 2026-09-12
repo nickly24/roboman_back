@@ -6,14 +6,18 @@ from __future__ import annotations
 
 import base64
 import json
+import hashlib
+import hmac
+import secrets
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from functools import wraps
 from typing import Any, Callable, Iterator, Literal, TypeVar
 
 from flask import Response, abort, g, request
+from werkzeug.security import check_password_hash, generate_password_hash
 
 # Импорт конфига и mysql — shared не должен импортировать main
 from mysql.connector import pooling  # type: ignore
@@ -86,7 +90,7 @@ def exec_one(cur: Any, sql: str, params: tuple[Any, ...] = ()) -> int:
 
 
 # --- Auth ---
-Role = Literal["OWNER", "TEACHER"]
+Role = Literal["OWNER", "TEACHER", "BRANCH"]
 
 
 @dataclass(frozen=True)
@@ -96,6 +100,43 @@ class CurrentUser:
     owner_id: int | None
     teacher_id: int | None
     login: str
+    branch_id: int | None = None
+
+
+def password_matches(stored: str, supplied: str) -> bool:
+    """Read legacy plaintext passwords; all newly written passwords are hashed."""
+    if stored.startswith(('scrypt:', 'pbkdf2:')):
+        try:
+            return check_password_hash(stored, supplied)
+        except (ValueError, TypeError):
+            return False
+    return hmac.compare_digest(stored.encode('utf-8'), supplied.encode('utf-8'))
+
+
+def hash_password(value: Any) -> str:
+    if not isinstance(value, str) or not 8 <= len(value) <= 256:
+        abort(400, description='Пароль должен содержать от 8 до 256 символов')
+    return generate_password_hash(value)
+
+
+def create_session(cur: Any, user_id: int) -> str:
+    token = secrets.token_urlsafe(48)
+    exec_one(cur, 'INSERT INTO auth_sessions(token_hash,user_id,expires_at) VALUES (%s,%s,%s)',
+             (hashlib.sha256(token.encode()).hexdigest(), user_id, datetime.utcnow() + timedelta(days=30)))
+    return token
+
+
+def revoke_session(cur: Any) -> None:
+    token = _extract_token()
+    if token:
+        cur.execute('DELETE FROM auth_sessions WHERE token_hash=%s', (hashlib.sha256(token.encode()).hexdigest(),))
+
+
+def enforce_branch_route(user: CurrentUser) -> None:
+    """External accounts cannot fall through legacy OWNER/TEACHER route logic."""
+    endpoint = request.endpoint or ''
+    if user.role == 'BRANCH' and endpoint not in ('auth_me', 'auth_logout') and not endpoint.startswith('branch_portal.'):
+        abort(403, description='Этот раздел недоступен кабинету сада')
 
 
 def _extract_token() -> str | None:
@@ -112,29 +153,36 @@ def get_current_user() -> CurrentUser:
     tok = _extract_token()
     if not tok:
         abort(401, description="Missing Authorization Bearer token")
-    try:
-        user_id = int(tok)
-    except ValueError:
-        abort(401, description="Invalid token format")
+    if len(tok) < 40 or len(tok) > 128 or tok.isdigit():
+        abort(401, description="Сессия завершена. Войдите снова")
     with db_cursor() as (_, cur):
         row = fetch_one(
             cur,
-            "SELECT id, login, role, owner_id, teacher_id, is_active FROM auf_users WHERE id=%s",
-            (user_id,),
+            """SELECT u.id,u.login,u.role,u.owner_id,u.teacher_id,u.branch_id,u.is_active,
+                      b.is_active AS branch_is_active
+               FROM auth_sessions s JOIN auf_users u ON u.id=s.user_id
+               LEFT JOIN branches b ON b.id=u.branch_id
+               WHERE s.token_hash=%s AND s.expires_at > %s""",
+            (hashlib.sha256(tok.encode()).hexdigest(), datetime.utcnow()),
         )
         if not row:
             abort(401, description="Unknown user")
         if int(row["is_active"]) != 1:
             abort(403, description="User is inactive")
         role = row["role"]
-        if role not in ("OWNER", "TEACHER"):
+        if role not in ("OWNER", "TEACHER", "BRANCH"):
             abort(403, description="Invalid user role")
+        if role == 'BRANCH' and (not row.get('branch_id') or not row.get('branch_is_active')):
+            abort(403, description='Кабинет сада отключён')
+        if role == 'BRANCH' and (row.get('owner_id') is not None or row.get('teacher_id') is not None):
+            abort(403, description='Некорректная привязка кабинета сада')
         return CurrentUser(
             id=int(row["id"]),
             login=str(row["login"]),
             role=role,  # type: ignore[arg-type]
             owner_id=int(row["owner_id"]) if row["owner_id"] is not None else None,
             teacher_id=int(row["teacher_id"]) if row["teacher_id"] is not None else None,
+            branch_id=int(row['branch_id']) if row.get('branch_id') is not None else None,
         )
 
 
@@ -145,6 +193,7 @@ def require_auth(fn: F) -> F:
     @wraps(fn)
     def wrapper(*args: Any, **kwargs: Any) -> Any:
         g.current_user = get_current_user()
+        enforce_branch_route(g.current_user)
         return fn(*args, **kwargs)
     return wrapper  # type: ignore[return-value]
 
