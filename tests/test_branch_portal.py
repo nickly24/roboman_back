@@ -26,7 +26,7 @@ CREATE TABLE branches(id INTEGER PRIMARY KEY,department_id INTEGER,name TEXT,add
 CREATE TABLE teachers(id INTEGER PRIMARY KEY,full_name TEXT,color TEXT);
 CREATE TABLE instructions(id INTEGER PRIMARY KEY,name TEXT);
 CREATE TABLE curriculum_lessons(id INTEGER PRIMARY KEY,name TEXT);
-CREATE TABLE lessons(id INTEGER PRIMARY KEY,branch_id INTEGER,teacher_id INTEGER,starts_at DATETIME,paid_children INTEGER,trial_children INTEGER,is_creative INTEGER,instruction_id INTEGER,curriculum_lesson_id INTEGER,price_snapshot DECIMAL);
+CREATE TABLE lessons(id INTEGER PRIMARY KEY,branch_id INTEGER,teacher_id INTEGER,starts_at DATETIME,paid_children INTEGER,trial_children INTEGER,is_creative INTEGER,instruction_id INTEGER,curriculum_lesson_id INTEGER,price_snapshot DECIMAL,lesson_type TEXT NOT NULL DEFAULT 'LESSON',help_rate_snapshot DECIMAL);
 CREATE TABLE auf_users(id INTEGER PRIMARY KEY AUTOINCREMENT,login TEXT UNIQUE,password_hash TEXT,role TEXT,branch_id INTEGER,owner_id INTEGER,teacher_id INTEGER,is_active INTEGER DEFAULT 1,created_at DATETIME DEFAULT CURRENT_TIMESTAMP,updated_at DATETIME DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE auth_sessions(token_hash TEXT PRIMARY KEY,user_id INTEGER,expires_at DATETIME);
 CREATE TABLE branch_retail_prices(branch_id INTEGER,month TEXT,retail_price_per_child DECIMAL,updated_by_user_id INTEGER,updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,PRIMARY KEY(branch_id,month));
@@ -42,7 +42,7 @@ INSERT INTO department_owners VALUES(1,1),(2,2);
 INSERT INTO branches VALUES(1,1,'Ромашка','Москва',300,1),(2,2,'Чужой сад','Казань',500,1),(3,1,'Свободный сад','Москва',400,1);
 INSERT INTO teachers VALUES(1,'Анна','#123456');
 INSERT INTO instructions VALUES(1,'Робот');
-INSERT INTO lessons VALUES(1,1,1,'2026-09-07 10:00:00',10,2,0,1,NULL,300),(2,1,1,'2026-09-10 10:00:00',5,1,1,NULL,NULL,320),(3,2,1,'2026-09-10 10:00:00',8,0,0,1,NULL,500),(4,1,1,'2026-09-11 10:00:00',0,4,0,1,NULL,300);
+INSERT INTO lessons(id,branch_id,teacher_id,starts_at,paid_children,trial_children,is_creative,instruction_id,curriculum_lesson_id,price_snapshot) VALUES(1,1,1,'2026-09-07 10:00:00',10,2,0,1,NULL,300),(2,1,1,'2026-09-10 10:00:00',5,1,1,NULL,NULL,320),(3,2,1,'2026-09-10 10:00:00',8,0,0,1,NULL,500),(4,1,1,'2026-09-11 10:00:00',0,4,0,1,NULL,300);
 INSERT INTO auf_users(id,login,password_hash,role,branch_id,is_active) VALUES(10,'garden','hidden','BRANCH',1,1),(20,'foreign','hidden','BRANCH',2,1);
 INSERT INTO calendar_series VALUES(1,1),(2,2);
 INSERT INTO calendar_versions VALUES(1,1,'2026-09-07',1,'10:00',60,1,'Анна',1),(2,2,'2026-09-07',1,'11:00',60,1,'Анна',1);
@@ -171,6 +171,31 @@ class BranchPortalTests(unittest.TestCase):
         with self.database() as (_,cur):
             cur.execute('SELECT COUNT(*) n FROM calendar_occurrences')
             self.assertEqual(cur.fetchone()['n'],0)
+
+    def test_help_is_visible_without_exposing_salary_or_charging_the_branch(self):
+        with self.database() as (_,cur):
+            cur.execute('''INSERT INTO lessons(id,branch_id,teacher_id,starts_at,paid_children,trial_children,
+                is_creative,price_snapshot,lesson_type,help_rate_snapshot)
+                VALUES(5,1,1,'2026-09-11 09:00:00',0,0,0,0,'HELP',750)''')
+        self.call('PUT','/portal/pricing?month=2026-09',{'retail_price_per_child':500},user='branch')
+        data = self.call('GET','/portal/overview?month=2026-09',user='branch')
+        summary = data['summary']
+        self.assertEqual((summary['lessons_count'],summary['help_count'],summary['total_children']),(3,1,22))
+        self.assertEqual((summary['accrued_amount'],summary['estimated_revenue'],summary['estimated_profit']),(4600,7500,2900))
+        help_row = next(row for row in data['lessons'] if row['id']==5)
+        self.assertEqual((help_row['lesson_type'],help_row['total_children'],help_row['amount']),('HELP',0,0))
+        self.assertNotIn('help_rate_snapshot',help_row)
+        self.assertNotIn('teacher_salary',help_row)
+        day = next(day for day in data['daily'] if day['date']=='2026-09-11')
+        self.assertEqual((day['lessons_count'],day['help_count'],day['trial_children']),(1,1,4))
+        listed = self.call('GET','/portal/lessons?month=2026-09',user='branch')['items']
+        self.assertIn(5,[lesson['id'] for lesson in listed])
+        self.assertNotIn(5,[lesson['id'] for lesson in self.call('GET','/portal/lessons?month=2026-09',user='branch2')['items']])
+        preview = self.call('GET','/accounting/invoices/report?branch_id=1&month=2026-09')
+        self.assertEqual((len(preview['items']),preview['total_amount']),(2,4600))
+        self.assertNotIn(5,[item['lesson_id'] for item in preview['items']])
+        self.call('POST','/accounting/invoices',dict(branch_id=1,month='2026-09',
+            items=[dict(lesson_id=5,description='Помощь',quantity=1,unit_price=750)]),code=400)
 
     def test_duplicate_month_cancel_and_stale_revision(self):
         row = self.draft()

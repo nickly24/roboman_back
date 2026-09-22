@@ -158,6 +158,16 @@ def _parse_int(name: str, v: Any, *, min_v: int | None = None, max_v: int | None
     return n
 
 
+def _parse_help_rate(value: Any) -> int:
+    try:
+        amount = Decimal(str(value))
+        if not amount.is_finite() or amount != amount.to_integral_value() or not 0 <= amount <= 99999999:
+            raise ValueError
+        return int(amount)
+    except (ValueError, ArithmeticError):
+        abort(400, description="Стоимость помощи должна быть целым неотрицательным числом до 99999999")
+
+
 def _parse_bool(v: Any) -> bool:
     if isinstance(v, bool):
         return v
@@ -233,6 +243,10 @@ def create_app() -> Flask:
     @app.errorhandler(404)
     def _e404(e):  # type: ignore[no-untyped-def]
         return _err("Not found", status=404, code="NOT_FOUND")
+
+    @app.errorhandler(409)
+    def _e409(e):  # type: ignore[no-untyped-def]
+        return _err(getattr(e, "description", "Conflict"), status=409, code="CONFLICT")
 
     @app.errorhandler(MySQLError)
     def _edb(e):  # type: ignore[no-untyped-def]
@@ -2034,6 +2048,9 @@ def create_app() -> Flask:
             return """
                 SELECT
                   l.id,
+                  lr.lesson_type,
+                  lr.help_rate_snapshot,
+                  lr.skipped_curriculum_lesson_id,
                   l.starts_at,
                   l.branch_id,
                   b.name AS branch_name,
@@ -2078,6 +2095,9 @@ def create_app() -> Flask:
         return """
             SELECT
               l.id,
+              lr.lesson_type,
+              lr.help_rate_snapshot,
+              lr.skipped_curriculum_lesson_id,
               l.starts_at,
               l.branch_id,
               b.name AS branch_name,
@@ -2154,7 +2174,14 @@ def create_app() -> Flask:
             params.append(int(teacher_id))
         if is_creative is not None and str(is_creative) != "":
             where.append("l.is_creative=%s")
+            where.append("l.lesson_type='LESSON'")
             params.append(1 if _parse_bool(is_creative) else 0)
+        if args.get("lesson_type"):
+            lesson_type = str(args["lesson_type"]).upper()
+            if lesson_type not in {"LESSON", "HELP"}:
+                abort(400, description="Invalid lesson_type")
+            where.append("l.lesson_type=%s")
+            params.append(lesson_type)
 
         include_financial = u.role == "OWNER"
         base = _lessons_base_select(include_financial=include_financial)
@@ -2214,11 +2241,27 @@ def create_app() -> Flask:
         instruction_id = body.get("instruction_id")
         curriculum_mode = body.get("curriculum_mode")
         curriculum_lesson_id = body.get("curriculum_lesson_id")
+        if curriculum_lesson_id not in (None, ""):
+            curriculum_lesson_id = _parse_int("curriculum_lesson_id", curriculum_lesson_id, min_v=1)
+        expected_lesson_id = body.get("curriculum_expected_lesson_id")
+        if expected_lesson_id not in (None, ""):
+            expected_lesson_id = _parse_int("curriculum_expected_lesson_id", expected_lesson_id, min_v=1)
+        lesson_type = str(body.get("lesson_type", "LESSON")).upper()
+        if lesson_type not in {"LESSON", "HELP"}:
+            abort(400, description="Invalid lesson_type")
+        is_help = lesson_type == "HELP"
         is_salary_free: int | None = None
         is_fixed_salary_2000_b = 1 if _parse_bool(body.get("is_fixed_salary_2000")) else 0
 
-        if branch_id is None or starts_at is None or paid_children is None or trial_children is None:
+        if branch_id is None or starts_at is None or (not is_help and (paid_children is None or trial_children is None)):
             abort(400, description="branch_id, starts_at, paid_children and trial_children are required")
+        if "help_rate_snapshot" in body or "skipped_curriculum_lesson_id" in body:
+            abort(400, description="Lesson snapshots are set by the server")
+        if is_help and any(body.get(key) not in (None, "", 0, False) for key in (
+            "paid_children", "trial_children", "is_creative", "instruction_id", "curriculum_mode",
+            "curriculum_run_id", "curriculum_lesson_id", "curriculum_expected_lesson_id", "is_fixed_salary_2000", "price_snapshot",
+        )):
+            abort(400, description="Help cannot have children, a topic or curriculum")
 
         # teacher_id: TEACHER всегда сам, OWNER может передать
         teacher_id = body.get("teacher_id")
@@ -2228,9 +2271,9 @@ def create_app() -> Flask:
             if teacher_id is None:
                 abort(400, description="teacher_id is required for OWNER create")
 
-        paid_i = _parse_int("paid_children", paid_children, min_v=0)
-        trial_i = _parse_int("trial_children", trial_children, min_v=0)
-        if paid_i + trial_i <= 0:
+        paid_i = 0 if is_help else _parse_int("paid_children", paid_children, min_v=0)
+        trial_i = 0 if is_help else _parse_int("trial_children", trial_children, min_v=0)
+        if not is_help and paid_i + trial_i <= 0:
             abort(400, description="paid_children + trial_children must be > 0")
 
         try:
@@ -2239,6 +2282,9 @@ def create_app() -> Flask:
             abort(400, description=str(error))
 
         with db_cursor() as (_, cur):
+            # Lesson creation and plan assignment serialize before any consistent
+            # read, so concurrent submissions cannot skip the same step twice.
+            fetch_one(cur, "SELECT id FROM branches WHERE id=%s FOR UPDATE", (int(branch_id),))
             # scope checks
             if u.role == "OWNER":
                 ok = fetch_one(
@@ -2264,15 +2310,26 @@ def create_app() -> Flask:
 
             from blueprints.curriculum import validate_lesson_curriculum
 
-            curriculum = validate_lesson_curriculum(
-                cur,
-                int(branch_id),
-                str(curriculum_mode) if curriculum_mode not in (None, "") else None,
-                curriculum_lesson_id,
-                instruction_id,
-            )
+            help_rate_snapshot = None
+            if is_help:
+                rate = fetch_one(cur, "SELECT value_int FROM settings WHERE `key`=%s", ("teacher_help_rate",))
+                if rate is None or rate.get("value_int") is None:
+                    abort(409, description="Укажите стоимость помощи в настройках зарплаты")
+                help_rate_snapshot = _parse_help_rate(rate["value_int"])
+                curriculum = {"run_id": None, "lesson_id": None, "mode": None, "instruction_id": None}
+            else:
+                curriculum = validate_lesson_curriculum(
+                    cur,
+                    int(branch_id),
+                    str(curriculum_mode) if curriculum_mode not in (None, "") else None,
+                    curriculum_lesson_id,
+                    instruction_id,
+                    expected_lesson_id,
+                )
             instruction_id = curriculum["instruction_id"]
-            if curriculum["run_id"] is None:
+            if is_help:
+                is_creative_b = 0
+            elif curriculum["run_id"] is None:
                 if is_creative is None:
                     abort(400, description="is_creative is required for a branch without curriculum")
                 is_creative_b = 1 if _parse_bool(is_creative) else 0
@@ -2286,7 +2343,7 @@ def create_app() -> Flask:
             br = fetch_one(cur, "SELECT price_per_child FROM branches WHERE id=%s", (int(branch_id),))
             if not br:
                 abort(400, description="Unknown branch")
-            price_snapshot = br["price_per_child"]
+            price_snapshot = 0 if is_help else br["price_per_child"]
 
             if is_salary_free is None:
                 trow = fetch_one(cur, "SELECT is_salary_free FROM teachers WHERE id=%s", (int(teacher_id),))
@@ -2298,9 +2355,10 @@ def create_app() -> Flask:
                 INSERT INTO lessons(
                   branch_id, teacher_id, starts_at, paid_children, trial_children,
                   is_creative, instruction_id, curriculum_run_id, curriculum_lesson_id, curriculum_mode,
-                  is_salary_free, is_fixed_salary_2000, price_snapshot, created_by_user_id
+                  is_salary_free, is_fixed_salary_2000, price_snapshot, created_by_user_id,
+                  lesson_type, help_rate_snapshot, skipped_curriculum_lesson_id
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 """,
                 (
                     int(branch_id),
@@ -2317,6 +2375,9 @@ def create_app() -> Flask:
                     is_fixed_salary_2000_b,
                     price_snapshot,
                     u.id,
+                    lesson_type,
+                    help_rate_snapshot,
+                    curriculum.get("skipped_lesson_id"),
                 ),
             )
         return lessons_get(lid)
@@ -2332,11 +2393,13 @@ def create_app() -> Flask:
             if not row:
                 abort(404)
 
+            is_help = row.get("lesson_type") == "HELP"
+
             if u.role == "TEACHER":
                 if int(row["teacher_id"]) != int(u.teacher_id or 0):
                     abort(403, description="Can edit only own lessons")
 
-                allowed = {"starts_at", "paid_children", "trial_children", "is_fixed_salary_2000"}
+                allowed = {"starts_at", "paid_children", "trial_children", "is_fixed_salary_2000", "lesson_type"}
                 forbidden = set(body.keys()) - allowed
                 if forbidden:
                     abort(403, description=f"Teacher cannot edit fields: {sorted(forbidden)}")
@@ -2356,6 +2419,14 @@ def create_app() -> Flask:
                 )
                 if not ok:
                     abort(404)
+
+            if "lesson_type" in body and body["lesson_type"] != row.get("lesson_type", "LESSON"):
+                abort(409, description="Lesson type cannot be changed")
+            if set(body) & {"help_rate_snapshot", "skipped_curriculum_lesson_id", "curriculum_mode", "curriculum_run_id", "curriculum_lesson_id"}:
+                abort(400, description="Lesson snapshots and curriculum cannot be edited")
+            if is_help and set(body) - {"starts_at", "teacher_id", "lesson_type"}:
+                abort(400, description="Help only allows editing the date and teacher")
+
 
             fields: list[str] = []
             params: list[Any] = []
@@ -2399,7 +2470,7 @@ def create_app() -> Flask:
             # базовая валидация "пустых" занятий
             new_paid = int(body.get("paid_children", row["paid_children"]))
             new_trial = int(body.get("trial_children", row["trial_children"]))
-            if new_paid + new_trial <= 0:
+            if not is_help and new_paid + new_trial <= 0:
                 abort(400, description="paid_children + trial_children must be > 0")
 
             cur.execute(f"UPDATE lessons SET {', '.join(fields)} WHERE id=%s", tuple(params + [lesson_id]))
@@ -2426,6 +2497,9 @@ def create_app() -> Flask:
             )
             if not ok:
                 abort(404)
+            lesson = fetch_one(cur, "SELECT lesson_type FROM lessons WHERE id=%s", (lesson_id,))
+            if lesson and lesson["lesson_type"] == "HELP":
+                abort(409, description="Help rate is a historical snapshot and cannot be repriced")
             cur.execute(
                 """
                 UPDATE lessons l
@@ -2521,6 +2595,15 @@ def create_app() -> Flask:
         if teacher_id:
             where.append("l.teacher_id=%s")
             params.append(int(teacher_id))
+        if args.get("is_creative") not in (None, ""):
+            where.append("l.is_creative=%s AND l.lesson_type='LESSON'")
+            params.append(1 if _parse_bool(args["is_creative"]) else 0)
+        if args.get("lesson_type"):
+            lesson_type = str(args["lesson_type"]).upper()
+            if lesson_type not in {"LESSON", "HELP"}:
+                abort(400, description="Invalid lesson_type")
+            where.append("l.lesson_type=%s")
+            params.append(lesson_type)
 
         include_financial = u.role == "OWNER"
         base = _lessons_base_select(include_financial=include_financial)
@@ -2553,6 +2636,9 @@ def create_app() -> Flask:
                 "department_name",
                 "branch_name",
                 "teacher_name",
+                "lesson_type",
+                "help_rate_snapshot",
+                "skipped_curriculum_lesson_id",
                 "paid_children",
                 "trial_children",
                 "total_children",
@@ -2573,6 +2659,9 @@ def create_app() -> Flask:
                 "department_name",
                 "branch_name",
                 "teacher_name",
+                "lesson_type",
+                "help_rate_snapshot",
+                "skipped_curriculum_lesson_id",
                 "paid_children",
                 "trial_children",
                 "total_children",
@@ -2587,7 +2676,12 @@ def create_app() -> Flask:
         w = csv.DictWriter(buf, fieldnames=cols)
         w.writeheader()
         for r in rows:
-            w.writerow({c: _to_jsonable(r.get(c)) for c in cols})
+            values = {c: _to_jsonable(r.get(c)) for c in cols}
+            if r.get("lesson_type") == "HELP":
+                for key in ("paid_children", "trial_children", "total_children", "is_creative", "price_snapshot"):
+                    if key in values:
+                        values[key] = None
+            w.writerow(values)
 
         return Response(
             buf.getvalue(),
@@ -2627,6 +2721,9 @@ def create_app() -> Flask:
         value_bool = body.get("value_bool")
         value_text = body.get("value_text")
         description = body.get("description")
+        if key == "teacher_help_rate":
+            value_int = _parse_help_rate(value_int)
+            value_decimal = value_bool = value_text = None
         with db_cursor() as (_, cur):
             cur.execute(
                 """
@@ -2655,7 +2752,7 @@ def create_app() -> Flask:
     @require_auth
     @require_role("OWNER")
     def settings_salary_get() -> Response:
-        keys = ["teacher_base_rate", "teacher_threshold_children", "teacher_bonus_per_child"]
+        keys = ["teacher_base_rate", "teacher_threshold_children", "teacher_bonus_per_child", "teacher_help_rate"]
         placeholders = ",".join(["%s"] * len(keys))
         with db_cursor() as (_, cur):
             rows = fetch_all(cur, f"SELECT * FROM settings WHERE `key` IN ({placeholders})", tuple(keys))
@@ -2672,12 +2769,15 @@ def create_app() -> Flask:
         bonus = body.get("teacher_bonus_per_child")
         if base_rate is None or threshold is None or bonus is None:
             abort(400, description="teacher_base_rate, teacher_threshold_children, teacher_bonus_per_child are required")
+        values = [
+            ("teacher_base_rate", int(base_rate)),
+            ("teacher_threshold_children", int(threshold)),
+            ("teacher_bonus_per_child", int(bonus)),
+        ]
+        if "teacher_help_rate" in body:
+            values.append(("teacher_help_rate", _parse_help_rate(body["teacher_help_rate"])))
         with db_cursor() as (_, cur):
-            for k, v in [
-                ("teacher_base_rate", int(base_rate)),
-                ("teacher_threshold_children", int(threshold)),
-                ("teacher_bonus_per_child", int(bonus)),
-            ]:
+            for k, v in values:
                 cur.execute(
                     """
                     INSERT INTO settings(`key`, value_int, description)
@@ -2741,8 +2841,11 @@ def create_app() -> Flask:
                   COALESCE(SUM(l.paid_children),0) AS paid_sum,
                   COALESCE(SUM(l.trial_children),0) AS trial_sum,
                   COALESCE(SUM(l.total_children),0) AS total_children_sum,
-                  COALESCE(COUNT(*),0) AS lessons_count,
-                  COALESCE(AVG(l.total_children),0) AS avg_children_per_lesson
+                  COALESCE(SUM(CASE WHEN l.lesson_type='LESSON' THEN 1 ELSE 0 END),0) AS lessons_count,
+                  COALESCE(SUM(CASE WHEN l.lesson_type='HELP' THEN 1 ELSE 0 END),0) AS help_count,
+                  COUNT(*) AS records_count,
+                  COALESCE(SUM(CASE WHEN l.lesson_type='HELP' THEN l.teacher_salary ELSE 0 END),0) AS help_salary_sum,
+                  COALESCE(AVG(CASE WHEN l.lesson_type='LESSON' THEN l.total_children END),0) AS avg_children_per_lesson
                 FROM v_lessons_calc l
                 JOIN branches b ON b.id=l.branch_id
                 WHERE {where_sql}
@@ -2756,7 +2859,10 @@ def create_app() -> Flask:
                 SELECT DATE_FORMAT(l.starts_at, '%%Y-%%m') AS period,
                        COALESCE(SUM(l.revenue),0) AS revenue_sum,
                        COALESCE(SUM(l.total_children),0) AS total_children_sum,
-                       COALESCE(COUNT(*),0) AS lessons_count
+                       COALESCE(SUM(CASE WHEN l.lesson_type='LESSON' THEN 1 ELSE 0 END),0) AS lessons_count,
+                       COALESCE(SUM(CASE WHEN l.lesson_type='HELP' THEN 1 ELSE 0 END),0) AS help_count,
+                       COUNT(*) AS records_count,
+                       COALESCE(SUM(CASE WHEN l.lesson_type='HELP' THEN l.teacher_salary ELSE 0 END),0) AS help_salary_sum
                 FROM v_lessons_calc l
                 JOIN branches b ON b.id=l.branch_id
                 WHERE {where_sql}
@@ -2772,7 +2878,10 @@ def create_app() -> Flask:
                 SELECT b.id AS branch_id, b.name AS branch_name,
                        COALESCE(SUM(l.revenue),0) AS revenue_sum,
                        COALESCE(SUM(l.total_children),0) AS total_children_sum,
-                       COALESCE(COUNT(*),0) AS lessons_count
+                       COALESCE(SUM(CASE WHEN l.lesson_type='LESSON' THEN 1 ELSE 0 END),0) AS lessons_count,
+                       COALESCE(SUM(CASE WHEN l.lesson_type='HELP' THEN 1 ELSE 0 END),0) AS help_count,
+                       COUNT(*) AS records_count,
+                       COALESCE(SUM(CASE WHEN l.lesson_type='HELP' THEN l.teacher_salary ELSE 0 END),0) AS help_salary_sum
                 FROM v_lessons_calc l
                 JOIN branches b ON b.id=l.branch_id
                 WHERE {where_sql}
@@ -2789,7 +2898,10 @@ def create_app() -> Flask:
                 SELECT t.id AS teacher_id, t.full_name AS teacher_name,
                        COALESCE(SUM(l.revenue),0) AS revenue_sum,
                        COALESCE(SUM(l.total_children),0) AS total_children_sum,
-                       COALESCE(COUNT(*),0) AS lessons_count
+                       COALESCE(SUM(CASE WHEN l.lesson_type='LESSON' THEN 1 ELSE 0 END),0) AS lessons_count,
+                       COALESCE(SUM(CASE WHEN l.lesson_type='HELP' THEN 1 ELSE 0 END),0) AS help_count,
+                       COUNT(*) AS records_count,
+                       COALESCE(SUM(CASE WHEN l.lesson_type='HELP' THEN l.teacher_salary ELSE 0 END),0) AS help_salary_sum
                 FROM v_lessons_calc l
                 JOIN branches b ON b.id=l.branch_id
                 JOIN teachers t ON t.id=l.teacher_id
@@ -2818,7 +2930,10 @@ def create_app() -> Flask:
                 SELECT
                   COALESCE(SUM(l.teacher_salary),0) AS salary_sum,
                   COALESCE(SUM(l.total_children),0) AS total_children_sum,
-                  COALESCE(COUNT(*),0) AS lessons_count
+                  COALESCE(SUM(CASE WHEN l.lesson_type='LESSON' THEN 1 ELSE 0 END),0) AS lessons_count,
+                  COALESCE(SUM(CASE WHEN l.lesson_type='HELP' THEN 1 ELSE 0 END),0) AS help_count,
+                  COUNT(*) AS records_count,
+                  COALESCE(SUM(CASE WHEN l.lesson_type='HELP' THEN l.teacher_salary ELSE 0 END),0) AS help_salary_sum
                 FROM v_lessons_calc l
                 JOIN branches b ON b.id=l.branch_id
                 WHERE {where_sql}
@@ -2827,7 +2942,9 @@ def create_app() -> Flask:
             )
             total_lessons = fetch_one(
                 cur,
-                "SELECT COUNT(*) AS total_lessons_count FROM lessons WHERE teacher_id=%s",
+                """SELECT COALESCE(SUM(CASE WHEN lesson_type='LESSON' THEN 1 ELSE 0 END),0) AS total_lessons_count,
+                    COALESCE(SUM(CASE WHEN lesson_type='HELP' THEN 1 ELSE 0 END),0) AS total_help_count,
+                    COUNT(*) AS total_records_count FROM lessons WHERE teacher_id=%s""",
                 (u.teacher_id,),
             )
         return _ok({"kpi": kpi, "total": total_lessons})
@@ -2850,7 +2967,10 @@ def create_app() -> Flask:
                   b.department_id,
                   d.name AS department_name,
                   COALESCE(SUM(l.teacher_salary),0) AS salary_sum,
-                  COALESCE(COUNT(*),0) AS lessons_count
+                  COALESCE(SUM(CASE WHEN l.lesson_type='LESSON' THEN 1 ELSE 0 END),0) AS lessons_count,
+                  COALESCE(SUM(CASE WHEN l.lesson_type='HELP' THEN 1 ELSE 0 END),0) AS help_count,
+                  COUNT(*) AS records_count,
+                  COALESCE(SUM(CASE WHEN l.lesson_type='HELP' THEN l.teacher_salary ELSE 0 END),0) AS help_salary_sum
                 FROM v_lessons_calc l
                 JOIN branches b ON b.id=l.branch_id
                 JOIN departments d ON d.id=b.department_id
@@ -2899,12 +3019,14 @@ def create_app() -> Flask:
         with db_cursor() as (_, cur):
             # Разбивка по датам: 1–15 (starts_at < start_16), 16–конец (starts_at >= start_16)
             if start and start_16 and end:
-                # Порядок %s в SQL: сначала 8 в SELECT (CASE), потом 3 в WHERE — параметры в том же порядке
+                # Порядок %s в SQL: сначала 12 в SELECT (CASE), потом 3 в WHERE — параметры в том же порядке
                 params_ext = [
                     start_fmt, start_16_fmt,  # salary_1_15
                     start_fmt, start_16_fmt,  # lessons_1_15
                     start_16_fmt, end_fmt,    # salary_16_end
                     start_16_fmt, end_fmt,    # lessons_16_end
+                    start_fmt, start_16_fmt,  # help_1_15
+                    start_16_fmt, end_fmt,    # help_16_end
                 ] + list(params)
                 rows = fetch_all(
                     cur,
@@ -2915,11 +3037,16 @@ def create_app() -> Flask:
                       l.teacher_id,
                       t.full_name AS teacher_name,
                       COALESCE(SUM(l.teacher_salary),0) AS salary_sum,
-                      COALESCE(COUNT(*),0) AS lessons_count,
+                      COALESCE(SUM(CASE WHEN l.lesson_type='LESSON' THEN 1 ELSE 0 END),0) AS lessons_count,
+                      COALESCE(SUM(CASE WHEN l.lesson_type='HELP' THEN 1 ELSE 0 END),0) AS help_count,
+                      COUNT(*) AS records_count,
+                      COALESCE(SUM(CASE WHEN l.lesson_type='HELP' THEN l.teacher_salary ELSE 0 END),0) AS help_salary_sum,
                       COALESCE(SUM(CASE WHEN l.starts_at >= %s AND l.starts_at < %s THEN l.teacher_salary ELSE 0 END),0) AS salary_1_15,
-                      COALESCE(SUM(CASE WHEN l.starts_at >= %s AND l.starts_at < %s THEN 1 ELSE 0 END),0) AS lessons_1_15,
+                      COALESCE(SUM(CASE WHEN l.starts_at >= %s AND l.starts_at < %s AND l.lesson_type='LESSON' THEN 1 ELSE 0 END),0) AS lessons_1_15,
                       COALESCE(SUM(CASE WHEN l.starts_at >= %s AND l.starts_at < %s THEN l.teacher_salary ELSE 0 END),0) AS salary_16_end,
-                      COALESCE(SUM(CASE WHEN l.starts_at >= %s AND l.starts_at < %s THEN 1 ELSE 0 END),0) AS lessons_16_end
+                      COALESCE(SUM(CASE WHEN l.starts_at >= %s AND l.starts_at < %s AND l.lesson_type='LESSON' THEN 1 ELSE 0 END),0) AS lessons_16_end,
+                      COALESCE(SUM(CASE WHEN l.starts_at >= %s AND l.starts_at < %s AND l.lesson_type='HELP' THEN 1 ELSE 0 END),0) AS help_1_15,
+                      COALESCE(SUM(CASE WHEN l.starts_at >= %s AND l.starts_at < %s AND l.lesson_type='HELP' THEN 1 ELSE 0 END),0) AS help_16_end
                     FROM v_lessons_calc l
                     JOIN branches b ON b.id=l.branch_id
                     JOIN departments d ON d.id=b.department_id
@@ -2940,11 +3067,16 @@ def create_app() -> Flask:
                       l.teacher_id,
                       t.full_name AS teacher_name,
                       COALESCE(SUM(l.teacher_salary),0) AS salary_sum,
-                      COALESCE(COUNT(*),0) AS lessons_count,
+                      COALESCE(SUM(CASE WHEN l.lesson_type='LESSON' THEN 1 ELSE 0 END),0) AS lessons_count,
+                      COALESCE(SUM(CASE WHEN l.lesson_type='HELP' THEN 1 ELSE 0 END),0) AS help_count,
+                      COUNT(*) AS records_count,
+                      COALESCE(SUM(CASE WHEN l.lesson_type='HELP' THEN l.teacher_salary ELSE 0 END),0) AS help_salary_sum,
                       0 AS salary_1_15,
                       0 AS lessons_1_15,
                       0 AS salary_16_end,
-                      0 AS lessons_16_end
+                      0 AS lessons_16_end,
+                      0 AS help_1_15,
+                      0 AS help_16_end
                     FROM v_lessons_calc l
                     JOIN branches b ON b.id=l.branch_id
                     JOIN departments d ON d.id=b.department_id
@@ -2972,6 +3104,11 @@ def create_app() -> Flask:
                 "teacher_name": r["teacher_name"],
                 "salary_sum": salary_sum,
                 "lessons_count": int(r["lessons_count"] or 0),
+                "help_count": int(r["help_count"] or 0),
+                "records_count": int(r["records_count"] or 0),
+                "help_salary_sum": float(r["help_salary_sum"] or 0),
+                "help_1_15": int(r["help_1_15"] or 0),
+                "help_16_end": int(r["help_16_end"] or 0),
                 "salary_1_15": float(r["salary_1_15"] or 0),
                 "lessons_1_15": int(r["lessons_1_15"] or 0),
                 "salary_16_end": float(r["salary_16_end"] or 0),
@@ -2997,7 +3134,10 @@ def create_app() -> Flask:
                        COALESCE(SUM(l.revenue),0) AS revenue_sum,
                        COALESCE(SUM(l.paid_children),0) AS paid_sum,
                        COALESCE(SUM(l.trial_children),0) AS trial_sum,
-                       COALESCE(COUNT(*),0) AS lessons_count
+                       COALESCE(SUM(CASE WHEN l.lesson_type='LESSON' THEN 1 ELSE 0 END),0) AS lessons_count,
+                       COALESCE(SUM(CASE WHEN l.lesson_type='HELP' THEN 1 ELSE 0 END),0) AS help_count,
+                       COUNT(*) AS records_count,
+                       COALESCE(SUM(CASE WHEN l.lesson_type='HELP' THEN l.teacher_salary ELSE 0 END),0) AS help_salary_sum
                 FROM v_lessons_calc l
                 JOIN branches b ON b.id=l.branch_id
                 WHERE {where_sql}
@@ -3049,7 +3189,10 @@ def create_app() -> Flask:
                 SELECT
                   COALESCE(SUM(l.revenue),0) AS revenue_sum,
                   COALESCE(SUM(l.total_children),0) AS total_children_sum,
-                  COALESCE(COUNT(*),0) AS lessons_count
+                  COALESCE(SUM(CASE WHEN l.lesson_type='LESSON' THEN 1 ELSE 0 END),0) AS lessons_count,
+                  COALESCE(SUM(CASE WHEN l.lesson_type='HELP' THEN 1 ELSE 0 END),0) AS help_count,
+                  COUNT(*) AS records_count,
+                  COALESCE(SUM(CASE WHEN l.lesson_type='HELP' THEN l.teacher_salary ELSE 0 END),0) AS help_salary_sum
                 FROM v_lessons_calc l
                 JOIN branches b ON b.id=l.branch_id
                 WHERE {where_sql}
@@ -3074,7 +3217,10 @@ def create_app() -> Flask:
                 SELECT
                   COALESCE(SUM(l.teacher_salary),0) AS salary_sum,
                   COALESCE(SUM(l.total_children),0) AS total_children_sum,
-                  COALESCE(COUNT(*),0) AS lessons_count
+                  COALESCE(SUM(CASE WHEN l.lesson_type='LESSON' THEN 1 ELSE 0 END),0) AS lessons_count,
+                  COALESCE(SUM(CASE WHEN l.lesson_type='HELP' THEN 1 ELSE 0 END),0) AS help_count,
+                  COUNT(*) AS records_count,
+                  COALESCE(SUM(CASE WHEN l.lesson_type='HELP' THEN l.teacher_salary ELSE 0 END),0) AS help_salary_sum
                 FROM v_lessons_calc l
                 JOIN branches b ON b.id=l.branch_id
                 WHERE {where_sql}

@@ -37,7 +37,7 @@ CREATE TABLE curriculum_modules(id INTEGER PRIMARY KEY,plan_id INTEGER,name TEXT
 CREATE TABLE instructions(id INTEGER PRIMARY KEY,name TEXT);
 CREATE TABLE curriculum_lessons(id INTEGER PRIMARY KEY,module_id INTEGER,name TEXT,sort_order INTEGER,format_id INTEGER,instruction_id INTEGER);
 CREATE TABLE branch_curriculum_runs(id INTEGER PRIMARY KEY,branch_id INTEGER,plan_id INTEGER,is_active INTEGER);
-CREATE TABLE lessons(id INTEGER PRIMARY KEY,branch_id INTEGER,starts_at DATETIME,teacher_id INTEGER,instruction_id INTEGER,is_creative INTEGER DEFAULT 0,curriculum_run_id INTEGER,curriculum_lesson_id INTEGER,curriculum_mode TEXT);
+CREATE TABLE lessons(id INTEGER PRIMARY KEY,branch_id INTEGER,starts_at DATETIME,teacher_id INTEGER,instruction_id INTEGER,is_creative INTEGER DEFAULT 0,curriculum_run_id INTEGER,curriculum_lesson_id INTEGER,curriculum_mode TEXT,lesson_type TEXT NOT NULL DEFAULT 'LESSON',skipped_curriculum_lesson_id INTEGER);
 CREATE TABLE calendar_audit(id INTEGER PRIMARY KEY AUTOINCREMENT,series_id INTEGER,occurrence_id INTEGER,actor_user_id INTEGER,actor_name TEXT,action TEXT,details_json TEXT,created_at DATETIME);
 INSERT INTO departments VALUES(1,'Первый'),(2,'Чужой');
 INSERT INTO department_owners VALUES(1,1),(2,2);
@@ -146,10 +146,40 @@ class CalendarTests(unittest.TestCase):
                           "INSERT INTO branch_curriculum_runs VALUES(1,1,1,1)"]:
                 cur.execute(query)
 
-    def record(self, id=1, start='2026-09-07 10:00:00', step=1, mode='PLAN', teacher=2, branch=1, instruction=1, run=1):
+    def record(self, id=1, start='2026-09-07 10:00:00', step=1, mode='PLAN', teacher=2, branch=1, instruction=1, run=1, lesson_type='LESSON', skipped=None):
         with self.database() as (_, cur):
-            cur.execute('INSERT INTO lessons(id,branch_id,starts_at,teacher_id,instruction_id,curriculum_run_id,curriculum_lesson_id,curriculum_mode) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)',
-                        (id,branch,start,teacher,instruction,run,step,mode))
+            cur.execute('INSERT INTO lessons(id,branch_id,starts_at,teacher_id,instruction_id,curriculum_run_id,curriculum_lesson_id,curriculum_mode,lesson_type,skipped_curriculum_lesson_id) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)',
+                        (id,branch,start,teacher,instruction,run,step,mode,lesson_type,skipped))
+
+    def test_skip_to_next_closes_skipped_and_taught_steps_for_forecast(self):
+        self.learning_seed()
+        self.record(step=2,instruction=2,mode='SKIP_TO_NEXT',skipped=1)
+        self.assertEqual(self.detail()['learning']['title'],'Карусель')
+        self.assertEqual(self.detail('2026-09-21')['learning']['kind'],'complete')
+        fact = self.call('GET','/recorded-lessons/1')['learning']
+        self.assertEqual((fact['title'],fact['curriculum_lesson_id'],fact['skipped_curriculum_lesson_id']),('Художник',2,1))
+        with self.database() as (_, cur):
+            cur.execute('DELETE FROM lessons WHERE id=1')
+        self.assertEqual(self.detail()['learning']['title'],'Мотоцикл')
+
+    def test_help_stays_a_separate_journal_record_and_does_not_advance_plan(self):
+        self.learning_seed()
+        self.record(start='2026-09-14 09:30:00',step=None,mode=None,instruction=None,run=None,lesson_type='HELP')
+        self.assertEqual(self.detail()['learning']['title'],'Мотоцикл')
+        with patch('blueprints.calendar.now',return_value=datetime(2026,9,15,18)):
+            rows = self.call('GET','/week?start=2026-09-14')['items']
+            self.assertEqual(len(rows),2)
+            self.assertEqual(self.detail()['learning']['kind'],'unrecorded')
+            help_row = next(row for row in rows if row.get('is_journal_only'))
+            self.assertEqual((help_row['lesson_type'],help_row['learning']['title']),('HELP','Помощь'))
+            self.assertEqual(help_row['starts_at'],'2026-09-14T09:30:00')
+            self.assertIsNone(help_row['learning']['instruction_id'])
+            self.assertEqual(self.detail('2026-09-21')['learning']['title'],'Мотоцикл')
+            self.assertEqual(self.call('GET','/recorded-lessons/1')['learning'],help_row['learning'])
+            self.call('GET','/recorded-lessons/1',user='3',code=404)
+            self.record(id=2,start='2026-09-14 11:00:00')
+            self.assertEqual(self.detail()['learning']['lesson_id'],2)
+            self.assertEqual(len(self.call('GET','/week?start=2026-09-14')['items']),2)
 
     def test_forecast_uses_completed_steps_and_intervening_unopened_weeks(self):
         self.learning_seed()

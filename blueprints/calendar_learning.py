@@ -13,10 +13,10 @@ from datetime import datetime, time, timedelta
 from flask import abort, g
 from shared import fetch_all
 
-CLOSING_MODES = {'PLAN', 'REPEAT', 'OFF_PLAN_REPLACE'}
+CLOSING_MODES = {'PLAN', 'REPEAT', 'OFF_PLAN_REPLACE', 'SKIP_TO_NEXT'}
 FACT_SELECT = '''SELECT l.id,l.branch_id,l.starts_at,l.teacher_id,t.full_name teacher_name,
-    l.instruction_id,i.name instruction_name,l.is_creative,
-    l.curriculum_run_id,l.curriculum_lesson_id,l.curriculum_mode,
+    l.lesson_type,l.instruction_id,i.name instruction_name,l.is_creative,
+    l.curriculum_run_id,l.curriculum_lesson_id,l.curriculum_mode,l.skipped_curriculum_lesson_id,
     cl.name curriculum_lesson_name,cl.format_id,lf.name format_name,
     cm.id module_id,cm.name module_name,cp.id plan_id,cp.name plan_name,
     b.name branch_name,b.address,b.department_id,d.name department_name
@@ -46,9 +46,12 @@ def fact_learning(fact, match='order'):
     mode = fact['curriculum_mode']
     off_plan = mode in {'OFF_PLAN_REPLACE', 'OFF_PLAN_PAUSE'}
     title = (fact['instruction_name'] if off_plan else fact['curriculum_lesson_name']) or fact['instruction_name'] or ('Творческое занятие' if fact['is_creative'] else 'Занятие без инструкции')
-    return dict(kind='actual', title=title, lesson_id=fact['id'], starts_at=fact['starts_at'],
+    if fact['lesson_type'] == 'HELP':
+        title = 'Помощь'
+    return dict(kind='actual', title=title, lesson_type=fact['lesson_type'], lesson_id=fact['id'], starts_at=fact['starts_at'],
                 teacher_id=fact['teacher_id'], teacher_name=fact['teacher_name'],
                 curriculum_lesson_id=fact['curriculum_lesson_id'], curriculum_mode=mode,
+                skipped_curriculum_lesson_id=fact['skipped_curriculum_lesson_id'],
                 curriculum_lesson_name=fact['curriculum_lesson_name'],
                 plan_id=fact['plan_id'], plan_name=fact['plan_name'],
                 module_id=fact['module_id'], module_name=fact['module_name'],
@@ -66,7 +69,8 @@ def match_facts(events, facts):
     for event in events:
         by_day[event['branch_id'], event['starts_at'].date()].append(event)
     for fact in facts:
-        facts_by_day[fact['branch_id'], fact['starts_at'].date()].append(fact)
+        if fact['lesson_type'] != 'HELP':
+            facts_by_day[fact['branch_id'], fact['starts_at'].date()].append(fact)
     matches = {}
     for key, slots in by_day.items():
         ordered_slots = sorted(slots, key=lambda slot: (slot['starts_at'], slot['series_id'], slot['week_start']))
@@ -137,6 +141,7 @@ def expand(cur, branch_ids, start, end):
 def recorded_event(fact):
     from .calendar import monday
     return dict(key=f"lesson:{fact['id']}", journal_lesson_id=fact['id'], is_journal_only=True,
+                lesson_type=fact['lesson_type'],
                 branch_id=fact['branch_id'], branch_name=fact['branch_name'], address=fact['address'],
                 department_id=fact['department_id'], department_name=fact['department_name'],
                 starts_at=fact['starts_at'], scheduled_starts_at=fact['starts_at'], display_date=fact['starts_at'].date(),
@@ -185,10 +190,12 @@ def enrich(cur, items, week=None):
                 steps[step['plan_id']].append(step)
             run_ids = tuple(r['id'] for r in runs.values())
             run_marks = ','.join(['%s'] * len(run_ids))
-            for row in fetch_all(cur, f'''SELECT curriculum_run_id,curriculum_lesson_id,curriculum_mode FROM lessons
-                WHERE curriculum_run_id IN ({run_marks}) AND curriculum_lesson_id IS NOT NULL AND starts_at < %s''', (*run_ids, tomorrow)):
+            for row in fetch_all(cur, f'''SELECT curriculum_run_id,curriculum_lesson_id,curriculum_mode,skipped_curriculum_lesson_id FROM lessons
+                WHERE curriculum_run_id IN ({run_marks}) AND curriculum_lesson_id IS NOT NULL AND lesson_type='LESSON' AND starts_at < %s''', (*run_ids, tomorrow)):
                 if row['curriculum_mode'] in CLOSING_MODES:
                     closed[row['curriculum_run_id']].add(row['curriculum_lesson_id'])
+                    if row['curriculum_mode'] == 'SKIP_TO_NEXT' and row['skipped_curriculum_lesson_id'] is not None:
+                        closed[row['curriculum_run_id']].add(row['skipped_curriculum_lesson_id'])
         projections = forecast([event for event in events if identity(event) not in matches], runs, steps, closed, at)
     visible_facts = set()
     for item in items:

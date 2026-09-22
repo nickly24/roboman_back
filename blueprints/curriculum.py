@@ -11,7 +11,7 @@ from shared import db_cursor, exec_one, fetch_all, fetch_one, get_current_user, 
 
 bp = Blueprint("curriculum", __name__)
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
-CLOSING_MODES = ("PLAN", "REPEAT", "OFF_PLAN_REPLACE")
+CLOSING_MODES = ("PLAN", "REPEAT", "OFF_PLAN_REPLACE", "SKIP_TO_NEXT")
 
 
 def _user() -> Any:
@@ -50,7 +50,7 @@ def _branch_access(cur: Any, branch_id: int, *, owner_only: bool = False) -> dic
 
 
 def _lesson_used(cur: Any, lesson_id: int) -> bool:
-    return bool(fetch_one(cur, "SELECT 1 FROM lessons WHERE curriculum_lesson_id=%s LIMIT 1", (lesson_id,)))
+    return bool(fetch_one(cur, "SELECT 1 FROM lessons WHERE curriculum_lesson_id=%s OR skipped_curriculum_lesson_id=%s LIMIT 1", (lesson_id, lesson_id)))
 
 
 def _plan_used(cur: Any, plan_id: int) -> bool:
@@ -60,7 +60,7 @@ def _plan_used(cur: Any, plan_id: int) -> bool:
             """
             SELECT 1
             FROM lessons l
-            JOIN curriculum_lessons cl ON cl.id=l.curriculum_lesson_id
+            JOIN curriculum_lessons cl ON (cl.id=l.curriculum_lesson_id OR cl.id=l.skipped_curriculum_lesson_id)
             JOIN curriculum_modules cm ON cm.id=cl.module_id
             WHERE cm.plan_id=%s LIMIT 1
             """,
@@ -77,7 +77,7 @@ def _plan_sequence(cur: Any, plan_id: int) -> list[dict[str, Any]]:
                cl.name, cl.internal_description, cl.external_description, cl.format_id,
                lf.name AS format_name, cl.instruction_id, i.name AS instruction_name,
                cl.sort_order, cl.created_at, cl.updated_at,
-               EXISTS(SELECT 1 FROM lessons x WHERE x.curriculum_lesson_id=cl.id) AS is_used,
+               EXISTS(SELECT 1 FROM lessons x WHERE x.curriculum_lesson_id=cl.id OR x.skipped_curriculum_lesson_id=cl.id) AS is_used,
                (SELECT COUNT(*) FROM curriculum_lesson_images img WHERE img.lesson_id=cl.id) AS image_count,
                (SELECT COUNT(*) FROM curriculum_lesson_comments c WHERE c.lesson_id=cl.id) AS lesson_comment_count,
                (SELECT COUNT(*) FROM instruction_comments ic WHERE ic.instruction_id=cl.instruction_id) AS instruction_comment_count
@@ -127,15 +127,17 @@ def get_run_progress(cur: Any, run: dict[str, Any]) -> dict[str, Any]:
     rows = fetch_all(
         cur,
         """
-        SELECT DISTINCT curriculum_lesson_id
+        SELECT DISTINCT curriculum_lesson_id, skipped_curriculum_lesson_id
         FROM lessons
         WHERE curriculum_run_id=%s
           AND curriculum_lesson_id IS NOT NULL
-          AND curriculum_mode IN ('PLAN','REPEAT','OFF_PLAN_REPLACE')
+          AND curriculum_mode IN ('PLAN','REPEAT','OFF_PLAN_REPLACE','SKIP_TO_NEXT')
         """,
         (int(run["id"]),),
     )
     closed_ids = {int(row["curriculum_lesson_id"]) for row in rows}
+    closed_ids.update(int(row["skipped_curriculum_lesson_id"]) for row in rows if row.get("skipped_curriculum_lesson_id") is not None)
+    remaining = [row for row in sequence if int(row["id"]) not in closed_ids]
     current = next((row for row in sequence if int(row["id"]) not in closed_ids), None)
     current_index = sequence.index(current) if current is not None else len(sequence)
     previous = [row for row in sequence[:current_index] if int(row["id"]) in closed_ids]
@@ -148,6 +150,7 @@ def get_run_progress(cur: Any, run: dict[str, Any]) -> dict[str, Any]:
         "total_lessons": len(sequence),
         "closed_lessons": len(closed_ids),
         "current_lesson": current,
+        "next_lesson": remaining[1] if len(remaining) > 1 else None,
         "last_lesson": last,
         "previous_lessons": previous,
         "is_completed": current is None,
@@ -165,6 +168,7 @@ def get_branch_progress(cur: Any, branch_id: int) -> dict[str, Any]:
             "total_lessons": 0,
             "closed_lessons": 0,
             "current_lesson": None,
+            "next_lesson": None,
             "last_lesson": None,
             "previous_lessons": [],
             "is_completed": False,
@@ -178,6 +182,7 @@ def validate_lesson_curriculum(
     mode: str | None,
     requested_lesson_id: Any,
     requested_instruction_id: Any,
+    expected_lesson_id: Any = None,
 ) -> dict[str, Any]:
     progress = get_branch_progress(cur, branch_id)
     if not progress["enabled"]:
@@ -186,11 +191,30 @@ def validate_lesson_curriculum(
         return {"run_id": None, "lesson_id": None, "mode": None, "instruction_id": requested_instruction_id}
 
     normalized = str(mode or "PLAN").upper()
-    if normalized not in {"PLAN", "REPEAT", "OFF_PLAN_REPLACE", "OFF_PLAN_PAUSE"}:
+    if normalized not in {*CLOSING_MODES, "OFF_PLAN_PAUSE"}:
         abort(400, description="Invalid curriculum_mode")
     current = progress["current_lesson"]
-    if normalized in {"PLAN", "OFF_PLAN_REPLACE"} and current is None:
+    if normalized in {"PLAN", "OFF_PLAN_REPLACE", "SKIP_TO_NEXT"} and current is None:
         abort(400, description="Curriculum plan is completed")
+
+    if expected_lesson_id not in (None, "") and (current is None or int(expected_lesson_id) != int(current["id"])):
+        abort(409, description="Current curriculum lesson has changed")
+
+    if normalized == "SKIP_TO_NEXT":
+        selected = progress["next_lesson"]
+        if selected is None:
+            abort(400, description="There is no next curriculum lesson")
+        if requested_lesson_id in (None, ""):
+            abort(400, description="curriculum_lesson_id is required for skip to next")
+        if int(requested_lesson_id) != int(selected["id"]):
+            abort(409, description="Next curriculum lesson has changed")
+        return {
+            "run_id": int(progress["run"]["id"]),
+            "lesson_id": int(selected["id"]),
+            "skipped_lesson_id": int(current["id"]),
+            "mode": normalized,
+            "instruction_id": selected.get("instruction_id"),
+        }
 
     if normalized == "PLAN":
         if requested_lesson_id not in (None, "") and int(requested_lesson_id) != int(current["id"]):
@@ -441,7 +465,7 @@ def modules_update(module_id: int) -> Response:
 @require_role("OWNER")
 def modules_delete(module_id: int) -> Response:
     with db_cursor() as (_, cur):
-        if fetch_one(cur, "SELECT 1 FROM lessons l JOIN curriculum_lessons cl ON cl.id=l.curriculum_lesson_id WHERE cl.module_id=%s LIMIT 1", (module_id,)):
+        if fetch_one(cur, "SELECT 1 FROM lessons l JOIN curriculum_lessons cl ON (cl.id=l.curriculum_lesson_id OR cl.id=l.skipped_curriculum_lesson_id) WHERE cl.module_id=%s LIMIT 1", (module_id,)):
             abort(409, description="Module contains used lessons")
         cur.execute("DELETE FROM curriculum_modules WHERE id=%s", (module_id,))
     return _ok({"deleted": True})
@@ -457,7 +481,7 @@ def modules_reorder(plan_id: int) -> Response:
         current_ids = [int(row["id"]) for row in current]
         if sorted(ids) != sorted(current_ids):
             abort(400, description="module_ids must contain every module exactly once")
-        used_rows = fetch_all(cur, "SELECT DISTINCT cl.module_id FROM lessons l JOIN curriculum_lessons cl ON cl.id=l.curriculum_lesson_id JOIN curriculum_modules cm ON cm.id=cl.module_id WHERE cm.plan_id=%s", (plan_id,))
+        used_rows = fetch_all(cur, "SELECT DISTINCT cl.module_id FROM lessons l JOIN curriculum_lessons cl ON (cl.id=l.curriculum_lesson_id OR cl.id=l.skipped_curriculum_lesson_id) JOIN curriculum_modules cm ON cm.id=cl.module_id WHERE cm.plan_id=%s", (plan_id,))
         used = {int(row["module_id"]) for row in used_rows}
         for module_id in used:
             if current_ids.index(module_id) != ids.index(module_id):
@@ -668,6 +692,7 @@ def branch_curriculum_update(branch_id: int) -> Response:
     enabled = bool(body.get("enabled"))
     plan_id = body.get("plan_id")
     with db_cursor() as (_, cur):
+        fetch_one(cur, "SELECT id FROM branches WHERE id=%s FOR UPDATE", (branch_id,))
         _branch_access(cur, branch_id, owner_only=True)
         active = _active_run(cur, branch_id)
         if not enabled:

@@ -126,7 +126,7 @@ def pricing(cur, branch_id, month):
 
 def recorded_lessons(cur, branch_id, month, retail=None):
     start, end = month_range(month)
-    rows = fetch_all(cur, '''SELECT l.id,l.starts_at,l.teacher_id,t.full_name AS teacher_name,t.color AS teacher_color,
+    rows = fetch_all(cur, '''SELECT l.id,l.starts_at,l.lesson_type,l.teacher_id,t.full_name AS teacher_name,t.color AS teacher_color,
         l.instruction_id,i.name AS instruction_name,cl.name AS curriculum_lesson_name,l.is_creative,
         l.paid_children,l.trial_children,(l.paid_children+l.trial_children) AS total_children,l.price_snapshot,
         (l.paid_children*l.price_snapshot) AS amount
@@ -248,9 +248,11 @@ def validated_items(cur, raw_items, branch_id, month):
         lesson_id = integer(item['lesson_id']) if item.get('lesson_id') else None
         if lesson_id:
             start,end = month_range(month)
-            lesson = fetch_one(cur, 'SELECT id FROM lessons WHERE id=%s AND branch_id=%s AND starts_at >= %s AND starts_at < %s', (lesson_id,branch_id,start,end))
+            lesson = fetch_one(cur, 'SELECT id,lesson_type FROM lessons WHERE id=%s AND branch_id=%s AND starts_at >= %s AND starts_at < %s', (lesson_id,branch_id,start,end))
             if not lesson:
                 abort(400,description='Занятие в строке не принадлежит выбранному саду и месяцу')
+            if lesson['lesson_type'] == 'HELP':
+                abort(400,description='Помощь на занятии не включается в счёт саду')
         quantity = money(item.get('quantity'), 'Количество', '999999.99')
         price = money(item.get('unit_price'), 'Стоимость')
         amount = money(quantity*price, maximum='999999999999.99')
@@ -286,21 +288,25 @@ def overview():
         lessons = recorded_lessons(cur,branch['id'],month,price['retail_price_per_child'])
         invoices = invoice_list(cur,month)
         upcoming = upcoming_lessons(cur,branch['id'],month)
-    daily = defaultdict(lambda:dict(lessons_count=0,paid_children=0,trial_children=0,amount=Decimal(0)))
+    daily = defaultdict(lambda:dict(lessons_count=0,help_count=0,paid_children=0,trial_children=0,amount=Decimal(0)))
     for lesson in lessons:
         day = daily[str(lesson['starts_at'])[:10]]
+        if lesson['lesson_type'] == 'HELP':
+            day['help_count'] += 1
+            continue
         day['lessons_count'] += 1
         day['paid_children'] += lesson['paid_children']
         day['trial_children'] += lesson['trial_children']
         day['amount'] += lesson['amount']
-    summary = dict(lessons_count=len(lessons),paid_children=sum(l['paid_children'] for l in lessons),
-        trial_children=sum(l['trial_children'] for l in lessons),total_children=sum(l['total_children'] for l in lessons),
-        accrued_amount=sum((l['amount'] for l in lessons),Decimal(0)),
+    teaching = [lesson for lesson in lessons if lesson['lesson_type'] != 'HELP']
+    summary = dict(lessons_count=len(teaching),help_count=len(lessons)-len(teaching),paid_children=sum(l['paid_children'] for l in teaching),
+        trial_children=sum(l['trial_children'] for l in teaching),total_children=sum(l['total_children'] for l in teaching),
+        accrued_amount=sum((l['amount'] for l in teaching),Decimal(0)),
         invoiced_amount=sum((Decimal(str(i['total_amount'])) for i in invoices if i['status']!='cancelled'),Decimal(0)),
         paid_amount=sum((Decimal(str(i['total_amount'])) for i in invoices if i['status']=='paid'),Decimal(0)),
         outstanding_amount=sum((Decimal(str(i['total_amount'])) for i in invoices if i['status'] in ('issued','payment_reported')),Decimal(0)),
-        estimated_revenue=sum((l['estimated_revenue'] for l in lessons),Decimal(0)) if price['retail_price_per_child'] is not None else None,
-        estimated_profit=sum((l['estimated_profit'] for l in lessons),Decimal(0)) if price['retail_price_per_child'] is not None else None)
+        estimated_revenue=sum((l['estimated_revenue'] for l in teaching),Decimal(0)) if price['retail_price_per_child'] is not None else None,
+        estimated_profit=sum((l['estimated_profit'] for l in teaching),Decimal(0)) if price['retail_price_per_child'] is not None else None)
     return _ok(dict(branch=branch,month=month,pricing=price,summary=summary,lessons=lessons,invoices=invoices,upcoming=upcoming,
         daily=[dict(date=day,**values) for day,values in sorted(daily.items())]))
 
@@ -397,7 +403,7 @@ def report_preview():
         lessons = recorded_lessons(cur,branch['id'],month)
         defaults = fetch_one(cur, 'SELECT seller_details,payment_details,buyer_details FROM branch_invoices WHERE branch_id=%s ORDER BY id DESC LIMIT 1', (branch['id'],)) or {}
     items = [dict(lesson_id=l['id'],description=l['curriculum_lesson_name'] or l['instruction_name'] or ('Творческое занятие' if l['is_creative'] else 'Занятие по робототехнике'),
-        lesson_date=l['starts_at'],teacher_name=l['teacher_name'],quantity=l['paid_children'],unit_price=l['price_snapshot'],amount=l['amount']) for l in reversed(lessons) if l['paid_children'] > 0]
+        lesson_date=l['starts_at'],teacher_name=l['teacher_name'],quantity=l['paid_children'],unit_price=l['price_snapshot'],amount=l['amount']) for l in reversed(lessons) if l['lesson_type'] != 'HELP' and l['paid_children'] > 0]
     return _ok(dict(items=items,total_amount=sum((i['amount'] for i in items),Decimal(0)),month=month,branch=branch,**defaults))
 
 
