@@ -273,6 +273,10 @@ def create_app() -> Flask:
     from blueprints.curriculum import bp as curriculum_bp
     app.register_blueprint(curriculum_bp, url_prefix=API_BASE)
 
+    from blueprints.teacher_certificates import bp as certificates_bp, public_bp as public_certificates_bp
+    app.register_blueprint(certificates_bp, url_prefix=f"{API_BASE}/teacher-certificates")
+    app.register_blueprint(public_certificates_bp, url_prefix=f"{API_BASE}/public/teacher-certificates")
+
     # ------------------------------------------------------------
     # Helpers for scoping
     # ------------------------------------------------------------
@@ -1446,8 +1450,14 @@ def create_app() -> Flask:
     @require_auth
     @require_role("OWNER")
     def teachers_delete(teacher_id: int) -> Response:
-        with db_cursor() as (_, cur):
-            cur.execute("DELETE FROM teachers WHERE id=%s", (teacher_id,))
+        try:
+            with db_cursor() as (_, cur):
+                cur.execute("DELETE FROM teachers WHERE id=%s", (teacher_id,))
+        except MySQLError as error:
+            if error.errno == 1451:
+                return _err('У преподавателя есть связанные записи или сертификат. Используйте статус «Уволен».',
+                    status=409, code='TEACHER_HAS_REFERENCES')
+            raise
         return _ok({"deleted": True})
 
     @app.get(f"{API_BASE}/teachers/<int:teacher_id>/branches")
