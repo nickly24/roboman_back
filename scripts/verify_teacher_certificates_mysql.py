@@ -509,8 +509,8 @@ class CertificateQA:
         self.check(sorted(statuses) == [200, 409], 'Concurrent edits accept one revision and reject the stale writer')
         first = self.request('GET', self.private_path(first))
         self.check(first['revision'] == parallel_revision + 1, 'Concurrent edits increment the revision only once')
-        # A missing configuration must not derive a canonical URL from the client.
-        with patch.dict(os.environ, {'PUBLIC_CERTIFICATE_BASE_URL': ''}):
+        # An invalid explicit override must not derive a canonical URL from the client.
+        with patch.dict(os.environ, {'PUBLIC_CERTIFICATE_BASE_URL': 'https://example.com/invalid/path'}):
             self.request('GET', self.private_path(first, '/pdf'), status=503)
             self.action(second, 'publish', status=503)
         self.first, self.second = first, second

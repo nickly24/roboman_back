@@ -23,6 +23,7 @@ bp = Blueprint('teacher_certificates', __name__)
 public_bp = Blueprint('public_teacher_certificates', __name__)
 MAX_PHOTO_BYTES = 5 * 1024 * 1024
 MAX_PHOTO_PIXELS = 20_000_000
+DEFAULT_PUBLIC_CERTIFICATE_BASE_URL = 'https://it-club-system.tps-eco.ru'
 TOKEN_PATTERN = re.compile(r'[A-Za-z0-9_-]{43}')
 FIELDS = {'university':250, 'study_program':250, 'description':3000}
 SELECT = '''SELECT c.id,c.teacher_id,c.number,c.public_token,c.status,c.university,c.study_program,
@@ -90,7 +91,8 @@ def text_fields(data):
 
 
 def public_base(required=False):
-    raw=os.environ.get('PUBLIC_CERTIFICATE_BASE_URL','').strip().rstrip('/')
+    raw=os.environ.get('PUBLIC_CERTIFICATE_BASE_URL','').strip()
+    raw=(raw or DEFAULT_PUBLIC_CERTIFICATE_BASE_URL).rstrip('/')
     try:
         parts=urlsplit(raw)
         valid=(bool(raw) and len(raw)<=512 and parts.scheme in ('http','https') and bool(parts.hostname)

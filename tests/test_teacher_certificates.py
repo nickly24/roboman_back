@@ -225,9 +225,35 @@ class TeacherCertificateTests(unittest.TestCase):
             self.assertFalse(image.getexif())
         with patch.object(certificates,'MAX_PHOTO_PIXELS',100):self.upload(valid,code=400)
 
-    def test_configuration_must_be_explicit_not_host_or_origin(self):
+    def test_default_production_origin_for_missing_or_empty_configuration(self):
         row=self.upload(self.draft(description='Описание'))
-        for value in ('','javascript:alert(1)','https://name:password@example.com','https://example.com/path?query=1',
+        expected='https://it-club-system.tps-eco.ru'+row['public_path']
+        for value in (None,'','   '):
+            with self.subTest(value=value),patch.dict(os.environ):
+                if value is None:
+                    os.environ.pop('PUBLIC_CERTIFICATE_BASE_URL',None)
+                else:
+                    os.environ['PUBLIC_CERTIFICATE_BASE_URL']=value
+                response=self.call('GET',f"/teacher-certificates/{row['id']}",
+                    headers={'Host':'attacker.test','Origin':'https://attacker.test'})
+                self.assertEqual(response.get_json()['data']['public_url'],expected)
+                with patch.object(certificates,'qr_png',return_value=b'PNG') as renderer:
+                    self.call('GET',f"/teacher-certificates/{row['id']}/qr",
+                        headers={'Host':'attacker.test','Origin':'https://attacker.test'})
+                    renderer.assert_called_once_with(expected)
+        with patch.dict(os.environ,{'PUBLIC_CERTIFICATE_BASE_URL':''}):
+            published=self.action(row,'publish')
+            self.assertEqual(published['public_url'],expected)
+            public=self.json('GET','/public/teacher-certificates/'+row['public_token'])
+            self.assertEqual(public['public_url'],expected)
+            pdf=self.call('GET',f"/teacher-certificates/{row['id']}/pdf")
+            with pymupdf.open(stream=pdf.data,filetype='pdf') as document:
+                links=[link.get('uri') for page in document for link in page.get_links()]
+            self.assertIn(expected,links)
+
+    def test_configuration_override_must_be_valid_not_host_or_origin(self):
+        row=self.upload(self.draft(description='Описание'))
+        for value in ('/','javascript:alert(1)','https://name:password@example.com','https://example.com/path?query=1',
             'https://example.com/#fragment','https://example.com:invalid','https://example.com/../path','https://example.com/app'):
             with patch.dict(os.environ,{'PUBLIC_CERTIFICATE_BASE_URL':value}):
                 response=self.call('POST',f"/teacher-certificates/{row['id']}/publish",{'revision':row['revision']},code=503,
@@ -238,7 +264,7 @@ class TeacherCertificateTests(unittest.TestCase):
             self.call('GET','/public/teacher-certificates/'+row['public_token']+'/qr',
                 headers={'Host':'attacker.test','Origin':'https://attacker.test'})
             renderer.assert_called_once_with('https://certificates.example'+row['public_path'])
-        with patch.dict(os.environ,{'PUBLIC_CERTIFICATE_BASE_URL':''}):
+        with patch.dict(os.environ,{'PUBLIC_CERTIFICATE_BASE_URL':'invalid-origin'}):
             self.call('GET',f"/teacher-certificates/{row['id']}/pdf",code=503)
 
     def test_input_types_lengths_search_and_export_atomicity(self):
